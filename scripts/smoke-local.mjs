@@ -19,33 +19,82 @@ child.stdout.setEncoding("utf8").on("data", (chunk) => output.push(chunk));
 child.stderr.setEncoding("utf8").on("data", (chunk) => output.push(chunk));
 
 const rooms = [];
+const gameRooms = [];
 const publicStates = new Map();
 const privateStates = new Map();
+const lobbyStates = new Map();
+const kickedNotices = new Set();
 const roomErrors = [];
 let revisions = new Map();
 try {
   await waitForServer();
-  const [first, second] = await Promise.all([login("gato1"), login("gato2")]);
+  const [first, second, third] = await Promise.all([login("gato1"), login("gato2"), login("gato3")]);
   await verifyThemePersistence(first);
   const client1 = new Client(gameUrl);
   const client2 = new Client(gameUrl);
-  const room1 = await client1.joinOrCreate("game", { token: first.token });
+  let room1 = await client1.create("game", { token: first.token, maxPlayers: 2, isPrivate: true });
   rooms.push(room1);
   registerRoom(room1);
-  const room2 = await client2.joinOrCreate("game", { token: second.token });
+  room1.send("refresh");
+  await waitUntil(() => lobbyStates.has(room1.sessionId), "the private room lobby");
+  const privateLobby = lobbyStates.get(room1.sessionId);
+  const resolvedPrivateRoom = await resolveRoomCode(privateLobby.roomCode);
+  if (resolvedPrivateRoom.roomId !== privateLobby.roomId) throw new Error("The private room code resolved to the wrong room.");
+  const initialListings = await listRooms();
+  if (initialListings.some((listedRoom) => listedRoom.roomId === privateLobby.roomId)) {
+    throw new Error("The private room appeared in the public room list.");
+  }
+
+  let room2 = await client2.joinById(resolvedPrivateRoom.roomId, { token: second.token, code: privateLobby.roomCode });
   rooms.push(room2);
   registerRoom(room2);
+  gameRooms.push(room1, room2);
   room1.send("refresh");
   room2.send("refresh");
-  room1.send("start-game");
   await waitUntil(
-    () => publicStates.size === 2 && privateStates.size === 2,
-    "both players to receive public and private state",
+    () => lobbyStates.get(room1.sessionId)?.autoStartAt !== null,
+    "the full-room start countdown",
+  );
+  room1.send("kick-player", { playerId: second.account.id });
+  await waitUntil(
+    () => kickedNotices.has(room2.sessionId) && lobbyStates.get(room1.sessionId)?.players.length === 1,
+    "the creator to kick a player before starting",
+  );
+  if (lobbyStates.get(room1.sessionId)?.autoStartAt !== null) {
+    throw new Error("The auto-start countdown did not cancel after the room stopped being full.");
+  }
+
+  const retryClient = new Client(gameUrl);
+  room2 = await retryClient.joinById(resolvedPrivateRoom.roomId, { token: second.token, code: privateLobby.roomCode });
+  rooms.push(room2);
+  registerRoom(room2);
+  gameRooms.splice(1, 1, room2);
+  room1.send("refresh");
+  room2.send("refresh");
+
+  const publicClient = new Client(gameUrl);
+  const publicRoom = await publicClient.create("game", { token: third.token, maxPlayers: 5, isPrivate: false });
+  rooms.push(publicRoom);
+  registerRoom(publicRoom);
+  publicRoom.send("refresh");
+  await waitUntil(() => lobbyStates.has(publicRoom.sessionId), "the public room lobby");
+  const listedRooms = await listRooms();
+  const publicLobby = lobbyStates.get(publicRoom.sessionId);
+  if (!listedRooms.some((listedRoom) => listedRoom.roomId === publicLobby.roomId)) {
+    throw new Error("The public room did not appear in the public room list.");
+  }
+  if (listedRooms.some((listedRoom) => listedRoom.roomId === privateLobby.roomId)) {
+    throw new Error("The private room appeared in the public room list.");
+  }
+
+  await waitUntil(
+    () => gameRooms.every((gameRoom) => publicStates.has(gameRoom.sessionId) && privateStates.has(gameRoom.sessionId)),
+    "the full room to start automatically and both players to receive state",
   );
 
   let publicState = publicStates.get(room1.sessionId);
   if (publicState.players.length !== 2) throw new Error("The room did not start with two players.");
-  for (const room of rooms) {
+  for (const room of gameRooms) {
     const privateState = privateStates.get(room.sessionId);
     const serialized = JSON.stringify(publicStates.get(room.sessionId));
     for (const card of privateState.hand) {
@@ -88,12 +137,12 @@ try {
   await resolvePendingCatPlacements();
   if (roomErrors.length) throw new Error(`The game server rejected a smoke-test command: ${roomErrors.join("; ")}`);
 
-  console.log("Smoke test passed: account theme persisted, drawn cats stayed private until placed, and two profiles advanced a turn safely.");
+  console.log("Smoke test passed: private codes stayed off the public list, public rooms were listed, creators could kick, full rooms auto-started, and two profiles advanced a turn safely.");
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   throw new Error(`${message}\n${output.join("")}`);
 } finally {
-  await Promise.all(rooms.map((room) => room.leave()));
+  await Promise.all(rooms.map((room) => Promise.race([room.leave(), delay(1500)])));
   if (child.exitCode === null && child.signalCode === null) {
     child.kill();
     await Promise.race([
@@ -104,7 +153,7 @@ try {
 }
 
 function registerRoom(room) {
-  room.onMessage("lobby", () => {});
+  room.onMessage("lobby", (state) => lobbyStates.set(room.sessionId, state));
   room.onMessage("presence", () => {});
   room.onMessage("public-state", (state) => {
     publicStates.set(room.sessionId, state);
@@ -112,6 +161,7 @@ function registerRoom(room) {
   });
   room.onMessage("private-state", (state) => privateStates.set(room.sessionId, state));
   room.onMessage("error", (message) => roomErrors.push(message));
+  room.onMessage("room-kicked", () => kickedNotices.add(room.sessionId));
   room.onMessage("notice", () => {});
 }
 
@@ -161,8 +211,30 @@ async function waitForServer() {
   }, "the local HTTP server");
 }
 
+async function listRooms() {
+  const response = await fetch(`${apiUrl}/api/rooms`);
+  const result = await response.json();
+  if (!response.ok || !Array.isArray(result.rooms)) {
+    throw new Error(`Could not list public rooms: ${result.error ?? response.statusText}`);
+  }
+  return result.rooms;
+}
+
+async function resolveRoomCode(code) {
+  const response = await fetch(`${apiUrl}/api/rooms/resolve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code }),
+  });
+  const result = await response.json();
+  if (!response.ok || !result.roomId) {
+    throw new Error(`Could not resolve the room code: ${result.error ?? response.statusText}`);
+  }
+  return result;
+}
+
 async function waitUntil(predicate, description) {
-  const deadline = Date.now() + 12000;
+  const deadline = Date.now() + 25000;
   while (Date.now() < deadline) {
     if (child.exitCode !== null) throw new Error(`The server exited before ${description}.\n${output.join("")}`);
     if (roomErrors.length) throw new Error(`The room rejected a command: ${roomErrors.join("; ")}`);
@@ -181,37 +253,52 @@ async function sendAndWait(room, sessionId, command, condition) {
   room.send("command", command);
   await waitUntil(
     () => (revisions.get(sessionId) ?? 0) > previousRevision &&
-      condition(publicStates.get(sessionId)),
+      condition(publicStates.get(sessionId), privateStates.get(sessionId)),
     `${command.type} to resolve`,
   );
 }
 
 async function resolvePendingCatPlacements() {
-  for (const room of rooms) {
-    const privateState = privateStates.get(room.sessionId);
-    if (!privateState) continue;
-    const hasCats = privateState.pendingCatPlacements.length > 0;
-    const hasDrawNotice = privateState.pendingDrawNotice.length > 0;
-    if (!hasCats && !hasDrawNotice) continue;
-    await sendAndWait(
-      room,
-      room.sessionId,
-      hasCats
-        ? {
+  for (const room of gameRooms) {
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      const current = privateStates.get(room.sessionId);
+      if (!current) break;
+      if (current.pendingPrivateNotice) {
+        const noticeId = current.pendingPrivateNotice.id;
+        await sendAndWait(room, room.sessionId, { type: "acknowledge-private-notice" }, (_state, next) =>
+          next?.pendingPrivateNotice?.id !== noticeId);
+        continue;
+      }
+      if (current.pendingDrawNotice) {
+        const notice = current.pendingDrawNotice;
+        const cat = current.pendingCatPlacements.find((pending) => pending.instanceId === notice.card.instanceId);
+        const command = cat
+          ? {
+            type: "choose-drawn-cats",
+            placements: [{ catInstanceId: cat.instanceId, to: "salon" }],
+          }
+          : { type: "acknowledge-draw" };
+        await sendAndWait(room, room.sessionId, command, (_state, next) =>
+          next?.pendingDrawNotice?.card.instanceId !== notice.card.instanceId);
+        continue;
+      }
+      if (current.pendingCatPlacements.length > 0) {
+        const catIds = current.pendingCatPlacements.map((cat) => cat.instanceId);
+        await sendAndWait(room, room.sessionId, {
           type: "choose-drawn-cats",
-          placements: privateState.pendingCatPlacements.map((cat) => ({
+          placements: current.pendingCatPlacements.map((cat) => ({
             catInstanceId: cat.instanceId,
             to: "salon",
           })),
-        }
-        : { type: "acknowledge-draw" },
-      (state) =>
-        !state.pendingCatPlacementPlayerIds.includes(privateState.playerId) &&
-        !state.pendingDrawNoticePlayerIds.includes(privateState.playerId),
-    );
+        }, (_state, next) =>
+          !catIds.some((id) => next?.pendingCatPlacements.some((cat) => cat.instanceId === id)));
+        continue;
+      }
+      break;
+    }
   }
   await waitUntil(
-    () => rooms.every((room) => publicStates.get(room.sessionId)?.pendingCatPlacementPlayerIds.length === 0),
+    () => gameRooms.every((room) => publicStates.get(room.sessionId)?.pendingCatPlacementPlayerIds.length === 0),
     "all drawn cats to be placed",
   );
 }

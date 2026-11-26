@@ -2,12 +2,15 @@ import { randomUUID } from "node:crypto";
 import { CARD_BY_ID } from "../../shared/card-catalog.js";
 import type { CardInstance } from "../../shared/cards.js";
 import type {
+  CombatResult,
   CombatState,
+  GameAnnouncement,
   GameCommand,
   GameLogEntry,
   GameState,
   MoveChoice,
   PendingEffect,
+  PrivateGameNotice,
   PlayerState,
   ResponseWindow,
   Zone,
@@ -63,8 +66,38 @@ function makePlayer(seat: PlayerSeat): PlayerState {
 }
 
 function addLog(state: GameState, text: string): void {
-  state.log.push({ id: randomUUID(), text, createdAt: Date.now() });
+  const entry = { id: randomUUID(), text, createdAt: Date.now() };
+  state.log.push(entry);
   if (state.log.length > 120) state.log.splice(0, state.log.length - 120);
+  addAnnouncement(state, null, text);
+}
+
+function addAnnouncement(
+  state: GameState,
+  actorId: string | null,
+  text: string,
+  cardIds: string[] = [],
+): void {
+  const announcement: GameAnnouncement = {
+    id: randomUUID(),
+    actorId,
+    text,
+    cardIds: [...new Set(cardIds)],
+    createdAt: Date.now(),
+  };
+  state.announcement = announcement;
+}
+
+function queuePrivateNotice(
+  state: GameState,
+  playerId: string,
+  text: string,
+  cardIds: string[],
+): void {
+  const notice: PrivateGameNotice = { id: randomUUID(), text, cardIds: [...new Set(cardIds)] };
+  const pending = state.pendingPrivateNotices[playerId] ?? [];
+  pending.push(notice);
+  state.pendingPrivateNotices[playerId] = pending;
 }
 
 function activePlayer(state: GameState): PlayerState {
@@ -125,13 +158,17 @@ function activeCatCount(player: PlayerState, cardId: string): number {
   return player.sofa.filter((cat) => cat.cardId === cardId).length;
 }
 
-function replenishToRuleLimit(state: GameState, player: PlayerState): void {
+function replenishToRuleLimit(
+  state: GameState,
+  player: PlayerState,
+  reason = "robo para llegar al mínimo de mano",
+): void {
   if (player.hand.length >= 3) return;
   let target = 3;
   if (activeCatCount(player, "cat-foresight") > 0) target = 4;
   if (synergyIsActive(player, "inventory-control", state)) target = 5;
   while (player.hand.length < target) {
-    if (drawCards(state, player, 1) === 0) break;
+    if (drawCards(state, player, 1, reason) === 0) break;
   }
 }
 
@@ -143,7 +180,7 @@ function drawInitial(state: GameState, player: PlayerState, useRaccoon: boolean)
     const instance = state.discard.pop();
     if (!instance) throw new RuleError("El descarte está vacío.");
     const definition = getCard(instance.cardId);
-    queueDrawNotice(state, player, instance);
+    queueDrawNotice(state, player, instance, "robo de inicio de turno por Gato Mapache");
     if (definition.kind === "cat") {
       queueCatPlacement(state, player, instance);
     } else {
@@ -153,9 +190,11 @@ function drawInitial(state: GameState, player: PlayerState, useRaccoon: boolean)
     const babyAlone = activeCatCount(player, "cat-baby") > 0 && player.sofa.length === 1;
     const feederBonus = player.structure?.cardId === "structure-feeder" ? 1 : 0;
     const babyBonus = hasActiveEffect(state, "nap") ? 0 : Number(babyAlone);
-    drawCards(state, player, 1 + feederBonus + babyBonus);
+    drawCards(state, player, 1, "robo base de inicio de turno");
+    if (feederBonus) drawCards(state, player, 1, "bonificación del Comedero");
+    if (babyBonus) drawCards(state, player, 1, "bonificación de Gato Bebé solo");
   }
-  replenishToRuleLimit(state, player);
+  replenishToRuleLimit(state, player, "robo para completar el mínimo de mano");
   state.initialDrawChoicePlayerId = null;
   delete state.pendingChoices[player.id];
   state.phase = "action";
@@ -298,8 +337,17 @@ function chooseDrawnCats(
   playerId: string,
   command: Extract<GameCommand, { type: "choose-drawn-cats" }>,
 ): void {
-  const cats = state.pendingCatPlacements[playerId];
-  if (!cats) throw new RuleError("No tienes gatos pendientes de colocar.");
+  const allCats = state.pendingCatPlacements[playerId];
+  if (!allCats?.length) throw new RuleError("No tienes gatos pendientes de colocar.");
+  const drawNotices = state.pendingDrawNotices[playerId];
+  const firstNotice = drawNotices?.[0];
+  const sequentialCat = firstNotice && getCard(firstNotice.card.cardId).kind === "cat"
+    ? allCats.find((cat) => cat.instanceId === firstNotice.card.instanceId)
+    : undefined;
+  if (firstNotice && getCard(firstNotice.card.cardId).kind === "cat" && !sequentialCat) {
+    throw new RuleError("El gato robado ya no está pendiente de colocación.");
+  }
+  const cats = sequentialCat ? [sequentialCat] : allCats;
   if (!Array.isArray(command.placements) || command.placements.length !== cats.length) {
     throw new RuleError("Elige un destino para cada gato.");
   }
@@ -326,8 +374,14 @@ function chooseDrawnCats(
     if (!destination) throw new RuleError("Elige un destino para cada gato.");
     placeCat(player, { ...cat, ownerId: player.id, zone: destination }, destination);
   }
-  delete state.pendingCatPlacements[playerId];
-  delete state.pendingDrawNotices[playerId];
+  if (sequentialCat) {
+    state.pendingCatPlacements[playerId] = allCats.filter((cat) => cat.instanceId !== sequentialCat.instanceId);
+    if (state.pendingCatPlacements[playerId]?.length === 0) delete state.pendingCatPlacements[playerId];
+    drawNotices?.shift();
+    if (drawNotices?.length === 0) delete state.pendingDrawNotices[playerId];
+  } else {
+    delete state.pendingCatPlacements[playerId];
+  }
   addLog(state, `${player.name} ha colocado los gatos recibidos en su casa.`);
   const capturedCombatCat = state.combat?.attackerId === playerId &&
     cats.some((cat) => cat.instanceId === state.combat?.targetCardInstanceId);
@@ -369,8 +423,11 @@ export function createGame(roomId: string, seats: PlayerSeat[]): GameState {
     initialCatChoices,
     pendingCatPlacements: {},
     pendingDrawNotices: {},
+    pendingPrivateNotices: {},
     privatePeeks: {},
     initialDrawChoicePlayerId: null,
+    announcement: null,
+    lastCombatResult: null,
     winnerId: null,
     endedReason: null,
     log: [],
@@ -403,6 +460,13 @@ function beginResponseWindow(state: GameState, pending: PendingEffect): void {
     expiresAt: Date.now() + RESPONSE_TIMEOUT_MS,
   };
   state.phase = "response";
+  const actor = getPlayer(state, pending.actorId);
+  addAnnouncement(
+    state,
+    actor.id,
+    `${actor.name} juega ${getCard(pending.card.cardId).name}.`,
+    [pending.card.cardId],
+  );
 }
 
 function requireResponsePlayer(state: GameState, playerId: string): void {
@@ -446,7 +510,7 @@ function moveChoice(state: GameState, actorId: string, movement: MoveChoice, ext
   const owner = getPlayer(state, movement.playerId);
   if (owner.turnFlags.includes("why-me-drew")) {
     owner.turnFlags = owner.turnFlags.filter((flag) => flag !== "why-me-drew");
-    drawCards(state, owner, 1);
+    drawCards(state, owner, 1, "sinergia ¿Por qué yo?");
     addLog(state, `${owner.name} roba 1 carta por ¿Por qué yo?.`);
   }
 }
@@ -575,7 +639,7 @@ function activatePreaction(
     if (cards.length !== count) throw new RuleError(`Debes descartar exactamente ${count} carta(s).`);
     const discarded = cards.map((id) => removeFromHand(player, id));
     for (const card of discarded) discardFromHand(state, player, card, true);
-    drawCards(state, player, count);
+    drawCards(state, player, count, "habilidad Los Trillizos");
     player.turnFlags.push("triplets-used");
     addLog(state, `${player.name} activa Los Trillizos y roba ${count} carta(s).`);
     checkVictory(state, player.id);
@@ -696,11 +760,14 @@ function resolveCardEffect(state: GameState, pending: PendingEffect): void {
   const definition = getCard(pending.card.cardId);
   const choices = pending.choices;
   let keepCardOnBoard = false;
+  const logCountBefore = state.log.length;
+  const publicCardIds: string[] = [];
 
   if (blockedByCatProtection(state, pending)) {
     state.discard.push(pending.card);
     state.phase = "action";
     addLog(state, `${definition.name} no afecta al gato protegido.`);
+    addAnnouncement(state, actor.id, `${definition.name} no afecta al gato protegido.`, [pending.card.cardId]);
     checkVictory(state, actor.id);
     return;
   }
@@ -711,6 +778,7 @@ function resolveCardEffect(state: GameState, pending: PendingEffect): void {
       target.skipNextTurn = true;
       target.skipCards.push(pending.card);
       keepCardOnBoard = true;
+      queuePrivateNotice(state, target.id, `${actor.name} juega ${definition.name}: perderás tu próximo turno.`, [pending.card.cardId]);
       addLog(state, `${target.name} perderá su próximo turno completo.`);
       break;
     }
@@ -738,6 +806,10 @@ function resolveCardEffect(state: GameState, pending: PendingEffect): void {
       combat.targetPlayerId = targetPlayerId;
       combat.targetCardInstanceId = targetCardInstanceId;
       combat.redirectPlayerId = targetPlayerId;
+      combat.defense = null;
+      combat.defenseSupports = [];
+      combat.defenseDamage = null;
+      combat.attackDamage = calculateAttackDamage(state, combat);
       combat.defenseExpiresAt = Date.now() + DEFENSE_TIMEOUT_MS;
       combat.redirectedPlayers.push(pending.actorId);
       combat.spentResponseCards.push(pending.card);
@@ -749,11 +821,11 @@ function resolveCardEffect(state: GameState, pending: PendingEffect): void {
     case "spy": {
       if (!state.combat) throw new RuleError("Espía de Ventana solo se usa durante un combate.");
       state.combat.revealed = true;
+      state.combat.attackDamage = calculateAttackDamage(state, state.combat);
       state.combat.spentResponseCards.push(pending.card);
-      if (choices.combatAfterSpy === true) {
-        keepCardOnBoard = true;
-        resolveCombat(state);
-      }
+      state.combat.defenseExpiresAt = Date.now() + DEFENSE_TIMEOUT_MS;
+      keepCardOnBoard = true;
+      addLog(state, `${actor.name} revela el Ataque con Espía de Ventana.`);
       break;
     }
     case "cancel":
@@ -763,6 +835,14 @@ function resolveCardEffect(state: GameState, pending: PendingEffect): void {
       const amount = target.hand.length === 0 ? 0 : Math.max(1, Math.floor(target.hand.length / 2));
       const discarded = randomRemove(target.hand, amount);
       for (const card of discarded) discardFromHand(state, target, card, true);
+      if (discarded.length > 0) {
+        queuePrivateNotice(
+          state,
+          target.id,
+          `${actor.name} usa ${definition.name}: estas son las cartas que has descartado al azar.`,
+          [definition.id, ...discarded.map((card) => card.cardId)],
+        );
+      }
       addLog(state, `${target.name} descarta ${discarded.length} carta(s) al azar.`);
       break;
     }
@@ -771,20 +851,52 @@ function resolveCardEffect(state: GameState, pending: PendingEffect): void {
       const count = definition.id === "action-table" ? 2 : 1;
       const threshold = definition.id === "action-table" ? 6 : 4;
       if (target.hand.length < threshold) throw new RuleError(`El objetivo necesita al menos ${threshold} cartas en mano.`);
-      actor.hand.push(...randomRemove(target.hand, count));
+      const stolen = randomRemove(target.hand, count);
+      actor.hand.push(...stolen);
+      const stolenCardIds = stolen.map((card) => card.cardId);
+      queuePrivateNotice(state, actor.id, `Has robado ${stolen.length} carta(s) a ${target.name} con ${definition.name}.`, [definition.id, ...stolenCardIds]);
+      queuePrivateNotice(state, target.id, `${actor.name} te ha robado ${stolen.length} carta(s) con ${definition.name}.`, [definition.id, ...stolenCardIds]);
       addLog(state, `${actor.name} roba cartas al azar de la mano de ${target.name}.`);
       break;
     }
-    case "swap_cats":
+    case "swap_cats": {
+      const target = chooseTargetPlayer(state, actor.id, choices.targetPlayerId);
+      const ownCat = typeof choices.ownCatInstanceId === "string" ? findCat(actor, choices.ownCatInstanceId) : undefined;
+      const targetCat = typeof choices.targetCatInstanceId === "string" ? findCat(target, choices.targetCatInstanceId) : undefined;
       swapCats(state, actor, choices);
+      if (ownCat && targetCat) {
+        publicCardIds.push(ownCat.cardId, targetCat.cardId);
+        queuePrivateNotice(
+          state,
+          target.id,
+          `${actor.name} intercambia un gato de cada casa con Puerta Gatera.`,
+          [definition.id, ownCat.cardId, targetCat.cardId],
+        );
+      }
       addLog(state, `${actor.name} usa Puerta Gatera para intercambiar gatos.`);
       break;
+    }
     case "steal_living_room_cat":
       stealSalonCat(state, actor, choices);
       break;
-    case "move_cat":
+    case "move_cat": {
+      const ownerId = typeof choices.ownerId === "string" ? choices.ownerId : actor.id;
+      const owner = getPlayer(state, ownerId);
+      const cat = typeof choices.catInstanceId === "string" ? findCat(owner, choices.catInstanceId) : undefined;
       moveWithLaser(state, actor, choices);
+      if (cat) {
+        publicCardIds.push(cat.cardId);
+        if (owner.id !== actor.id) {
+          queuePrivateNotice(
+            state,
+            owner.id,
+            `${actor.name} mueve tu ${getCard(cat.cardId).name} con Láser Infrarrojo.`,
+            [definition.id, cat.cardId],
+          );
+        }
+      }
       break;
+    }
     case "search_cat": {
       const index = state.deck.findIndex((card) => getCard(card.cardId).kind === "cat");
       if (index >= 0) {
@@ -794,7 +906,7 @@ function resolveCardEffect(state: GameState, pending: PendingEffect): void {
         addLog(state, `${actor.name} encuentra un gato con ¡Pspspsps!.`);
       } else {
         shuffle(state.deck);
-        drawCards(state, actor, 1);
+        drawCards(state, actor, 1, "Robo Felino no encontró gatos");
         addLog(state, `${actor.name} no encuentra gatos y roba una carta.`);
       }
       break;
@@ -803,7 +915,16 @@ function resolveCardEffect(state: GameState, pending: PendingEffect): void {
       const target = chooseTargetPlayer(state, actor.id, choices.targetPlayerId);
       if (!target.structure) throw new RuleError("Ese jugador no tiene una Estructura que destruir.");
       const destroyed = discardStructure(state, target);
-      if (destroyed) addLog(state, `${actor.name} destruye la Estructura de ${target.name}.`);
+      if (destroyed) {
+        publicCardIds.push(destroyed.cardId);
+        queuePrivateNotice(
+          state,
+          target.id,
+          `${actor.name} destruye tu Estructura con ${definition.name}.`,
+          [definition.id, destroyed.cardId],
+        );
+        addLog(state, `${actor.name} destruye la Estructura de ${target.name}.`);
+      }
       break;
     }
     case "retrieve_discard": {
@@ -817,6 +938,12 @@ function resolveCardEffect(state: GameState, pending: PendingEffect): void {
       } else {
         actor.hand.push(recovered);
       }
+      queuePrivateNotice(
+        state,
+        actor.id,
+        `Has recuperado ${getCard(recovered.cardId).name} con Ovillo de Lana.`,
+        [definition.id, recovered.cardId],
+      );
       addLog(state, `${actor.name} recupera una carta con Ovillo de Lana.`);
       break;
     }
@@ -838,21 +965,21 @@ function resolveCardEffect(state: GameState, pending: PendingEffect): void {
       keepCardOnBoard = true;
       break;
     case "draw_one_action":
-      drawCards(state, actor, 1);
+      drawCards(state, actor, 1, `${definition.name}: robo de 1 carta`);
       state.actionsRemaining += 1;
       break;
     case "draw_two":
-      drawCards(state, actor, 2);
+      drawCards(state, actor, 2, `${definition.name}: robo de 2 cartas`);
       break;
     case "draw_three":
-      drawCards(state, actor, 3);
+      drawCards(state, actor, 3, `${definition.name}: robo de 3 cartas`);
       break;
     case "group_draw": {
       const start = state.players.findIndex((player) => player.id === actor.id);
       for (let offset = 0; offset < state.players.length; offset += 1) {
-        drawCards(state, state.players[(start + offset) % state.players.length], 1);
+        drawCards(state, state.players[(start + offset) % state.players.length], 1, `${definition.name}: robo grupal de ${actor.name}`);
       }
-      drawCards(state, actor, 1);
+      drawCards(state, actor, 1, `${definition.name}: carta adicional`);
       break;
     }
     case "box":
@@ -893,6 +1020,17 @@ function resolveCardEffect(state: GameState, pending: PendingEffect): void {
   if (!keepCardOnBoard) state.discard.push(pending.card);
   if (state.phase !== "choice" && state.phase !== "combat") state.phase = "action";
   if (Object.keys(state.pendingCatPlacements).length === 0) checkVictory(state, actor.id);
+  const lastLog = state.log.length > logCountBefore ? state.log[state.log.length - 1]?.text : null;
+  const announcedCards = [pending.card.cardId];
+  if (definition.effect === "spy" && state.combat) {
+    announcedCards.push(state.combat.attack.cardId, ...state.combat.attackSupports.map((card) => card.cardId));
+  }
+  addAnnouncement(
+    state,
+    actor.id,
+    lastLog ?? `${actor.name} juega ${definition.name}.`,
+    [...announcedCards, ...publicCardIds],
+  );
 }
 
 function playStructure(
@@ -962,6 +1100,12 @@ function stealSalonCat(
   if (!cat) throw new RuleError("Robo Felino solo puede robar un gato del Salón.");
   removeCat(target, cat);
   queueCatPlacement(state, actor, { instanceId: cat.instanceId, cardId: cat.cardId });
+  queuePrivateNotice(
+    state,
+    target.id,
+    `${actor.name} te ha robado un gato del Salón con Robo Felino.`,
+    [cat.cardId],
+  );
   addLog(state, `${actor.name} roba un gato del Salón de ${target.name} y elige dónde colocarlo.`);
 }
 
@@ -1099,32 +1243,42 @@ function finishResponseWindow(state: GameState): void {
     state.discard.push(window.pending.card);
     const owner = getPlayer(state, window.pending.actorId);
     const hasVictim = !hasActiveEffect(state, "nap") && activeEffectTargets(owner, "cat-victim");
-    if (
+    const victimistDiscarder =
       canceler &&
       hasVictim &&
       getCard(window.pending.card.cardId).kind === "action" &&
       owner.id !== canceler
-    ) {
-      const cancelingPlayer = getPlayer(state, canceler);
-      if (cancelingPlayer.hand.length > 0) {
-        const card = cancelingPlayer.hand.pop();
-        if (card) discardFromHand(state, cancelingPlayer, card, true);
-        addLog(state, `${cancelingPlayer.name} descarta 1 carta por Victimista.`);
-      }
-    }
+        ? getPlayer(state, canceler)
+        : null;
     const actor = getPlayer(state, window.pending.actorId);
     const cardName = getCard(window.pending.card.cardId).name;
     const cancellingPlayer = canceler ? getPlayer(state, canceler) : null;
-    addLog(
+    const cancellationMessage = cancellingPlayer
+      ? `${actor.name} juega ${cardName}, pero ${cancellingPlayer.name} la cancela con Flús-Flús de Agua.`
+      : `${actor.name} juega ${cardName}, pero queda cancelada por Flús-Flús de Agua.`;
+    addLog(state, cancellationMessage);
+    if (victimistDiscarder?.hand.length) {
+      state.pendingDiscard = {
+        playerIds: [victimistDiscarder.id],
+        cursor: 0,
+        countByPlayer: { [victimistDiscarder.id]: 1 },
+        reason: `Victimista de ${owner.name}`,
+        next: state.combat ? "resume_combat" : "continue",
+        toLitter: true,
+      };
+      state.phase = "discard";
+      addLog(state, `${victimistDiscarder.name} debe elegir 1 carta para descartar por Victimista.`);
+    }
+    addAnnouncement(
       state,
-      cancellingPlayer
-        ? `${actor.name} juega ${cardName}, pero ${cancellingPlayer.name} la cancela con Flús-Flús de Agua.`
-        : `${actor.name} juega ${cardName}, pero queda cancelada por Flús-Flús de Agua.`,
+      canceler,
+      cancellationMessage,
+      [window.pending.card.cardId, ...window.stack.map((item) => item.card.cardId)],
     );
-    if (state.combat && getCard(window.pending.card.cardId).effect === "redirect_attack") {
+    const pendingEffect = getCard(window.pending.card.cardId).effect;
+    if (state.combat && (pendingEffect === "redirect_attack" || pendingEffect === "spy")) {
       state.combat.defenseExpiresAt = Date.now() + DEFENSE_TIMEOUT_MS;
     }
-    if (state.combat && window.pending.choices.combatAfterSpy === true) resolveCombat(state);
     return;
   }
 
@@ -1172,6 +1326,18 @@ function resolvePassResponse(state: GameState, playerId: string): void {
   requireResponsePlayer(state, playerId);
   const window = state.responseWindow;
   if (!window) throw new RuleError("No hay respuesta pendiente.");
+  const player = getPlayer(state, playerId);
+  const timedOut = Date.now() >= window.expiresAt;
+  const passMessage = timedOut
+    ? `${player.name} dejó vencer su tiempo y pasa sin gastar carta.`
+    : `${player.name} pasa sin gastar carta en la respuesta de Flús-Flús.`;
+  addLog(state, passMessage);
+  addAnnouncement(
+    state,
+    player.id,
+    passMessage,
+    [window.pending.card.cardId, ...window.stack.map((item) => item.card.cardId)],
+  );
   window.cursor += 1;
   if (window.cursor >= window.order.length) {
     finishResponseWindow(state);
@@ -1199,6 +1365,12 @@ function resolveFlush(state: GameState, playerId: string, instanceId: string): v
   window.cursor = 0;
   window.expiresAt = Date.now() + RESPONSE_TIMEOUT_MS;
   addLog(state, `${player.name} juega Flús-Flús de Agua.`);
+  addAnnouncement(
+    state,
+    player.id,
+    `${player.name} juega Flús-Flús de Agua.`,
+    [window.pending.card.cardId, ...window.stack.map((item) => item.card.cardId)],
+  );
 }
 
 function validateTarget(
@@ -1256,11 +1428,14 @@ function declareAttack(
     attackSupports: supports,
     defense: null,
     defenseSupports: [],
+    attackDamage: null,
+    defenseDamage: null,
     defenseExpiresAt: Date.now() + DEFENSE_TIMEOUT_MS,
     revealed: false,
     redirectedPlayers: [],
     spentResponseCards: [],
   };
+  state.combat.attackDamage = calculateAttackDamage(state, state.combat);
   if (attacker.scratcherArmed && !attacker.scratcherUsed) attacker.scratcherUsed = true;
   state.phase = "combat";
   addLog(state, `${attacker.name} declara un ataque contra ${target.name}.`);
@@ -1277,6 +1452,19 @@ function supportPower(cards: CardInstance[]): number {
   return cards.reduce((sum, card) => sum + (getCard(card.cardId).bonus ?? 0), 0);
 }
 
+function calculateAttackDamage(state: GameState, combat: CombatState): number {
+  const attacker = getPlayer(state, combat.attackerId);
+  const defender = getPlayer(state, combat.targetPlayerId);
+  const targetIsStructure = defender.structure?.instanceId === combat.targetCardInstanceId;
+  const attackBonus =
+    (!hasActiveEffect(state, "nap") && activeEffectTargets(attacker, "cat-neighborhood") && !synergyIsActive(attacker, "neighborhood-veterans", state) ? 1 : 0) +
+    (!hasActiveEffect(state, "nap") && targetIsStructure && activeEffectTargets(attacker, "cat-envious") ? 1 : 0) +
+    (attacker.scratcherUsed && attacker.scratcherArmed ? 1 : 0);
+  return getCombatBase(combat.attack, attacker, defender) +
+    supportPower(combat.attackSupports) +
+    attackBonus;
+}
+
 function resolveCombat(state: GameState): void {
   const combat = state.combat;
   if (!combat) throw new RuleError("No hay un combate activo.");
@@ -1285,18 +1473,43 @@ function resolveCombat(state: GameState): void {
   const targetCat = findCat(defender, combat.targetCardInstanceId);
   const targetIsStructure = defender.structure?.instanceId === combat.targetCardInstanceId;
   if (!targetCat && !targetIsStructure) throw new RuleError("El objetivo del combate ya no existe.");
-  const attackBase = getCombatBase(combat.attack, attacker, defender);
-  const attackBonus =
-    (!hasActiveEffect(state, "nap") && activeEffectTargets(attacker, "cat-neighborhood") && !synergyIsActive(attacker, "neighborhood-veterans", state) ? 1 : 0) +
-    (!hasActiveEffect(state, "nap") && targetIsStructure && activeEffectTargets(attacker, "cat-envious") ? 1 : 0) +
-    (attacker.scratcherUsed && attacker.scratcherArmed ? 1 : 0);
-  const attackPower = attackBase + supportPower(combat.attackSupports) + attackBonus;
-  const defensePower = combat.defense
+  const attackDamage = calculateAttackDamage(state, combat);
+  const defenseDamage = combat.defense
     ? getCombatBase(combat.defense, defender, attacker) +
       supportPower(combat.defenseSupports) +
       (!hasActiveEffect(state, "nap") && activeEffectTargets(defender, "cat-territorial") && !synergyIsActive(defender, "neighborhood-veterans", state) ? 1 : 0)
     : null;
-  const succeeded = defensePower === null || attackPower > defensePower;
+  const succeeded = defenseDamage === null || attackDamage > defenseDamage;
+  combat.attackDamage = attackDamage;
+  combat.defenseDamage = defenseDamage;
+  const result: CombatResult = {
+    id: randomUUID(),
+    attackerId: attacker.id,
+    defenderId: defender.id,
+    targetCardId: targetCat?.cardId ?? defender.structure?.cardId ?? combat.targetCardInstanceId,
+    attackCardId: combat.attack.cardId,
+    attackSupportCardIds: combat.attackSupports.map((card) => card.cardId),
+    defenseCardId: combat.defense?.cardId ?? null,
+    defenseSupportCardIds: combat.defenseSupports.map((card) => card.cardId),
+    attackDamage,
+    defenseDamage,
+    succeeded,
+  };
+  state.lastCombatResult = result;
+  const verdict = succeeded ? "Ataque exitoso" : "Defensa exitosa";
+  const defenseSummary = combat.defense
+    ? `; defensa ${getCard(combat.defense.cardId).name} (daño ${defenseDamage})`
+    : "; sin defensa";
+  const outcome = `${verdict}: ${getCard(combat.attack.cardId).name} (daño ${attackDamage})${defenseSummary}.`;
+  const announceOutcome = (text = `${outcome} ${attacker.name} contra ${defender.name}.`): void => {
+    addAnnouncement(state, attacker.id, text, [
+      result.targetCardId,
+      combat.attack.cardId,
+      ...combat.attackSupports.map((card) => card.cardId),
+      ...(combat.defense ? [combat.defense.cardId] : []),
+      ...combat.defenseSupports.map((card) => card.cardId),
+    ]);
+  };
   const targetZone = targetCat?.zone;
   let destroyedStructure: CardInstance | null = null;
   const defenderHasTriggeredCat =
@@ -1308,13 +1521,22 @@ function resolveCombat(state: GameState): void {
     if (targetCat) {
       removeCat(defender, targetCat);
       queueCatPlacement(state, attacker, { instanceId: targetCat.instanceId, cardId: targetCat.cardId });
+      queuePrivateNotice(
+        state,
+        defender.id,
+        `${attacker.name} captura tu gato tras vencer el combate.`,
+        [targetCat.cardId],
+      );
       addLog(state, `${attacker.name} captura un gato de ${defender.name} y elige dónde colocarlo.`);
+      announceOutcome();
     } else {
       destroyedStructure = discardStructure(state, defender);
       addLog(state, `${attacker.name} destruye la Estructura de ${defender.name}.`);
+      announceOutcome();
     }
   } else {
     addLog(state, `${defender.name} detiene el ataque.`);
+    announceOutcome();
   }
 
   if (defenderHasTriggeredCat && attacker.hand.length > 0) {
@@ -1328,6 +1550,7 @@ function resolveCombat(state: GameState): void {
     };
     state.phase = "discard";
     addLog(state, `${attacker.name} debe descartar 1 carta por una habilidad de ${defender.name}.`);
+    announceOutcome(`${outcome} ${attacker.name} debe descartar 1 carta por una habilidad de ${defender.name}.`);
     return;
   }
 
@@ -1342,6 +1565,7 @@ function resolveCombat(state: GameState): void {
     state.pendingChoices[attacker.id] = "salvage-structure";
     state.phase = "choice";
     addLog(state, `${attacker.name} puede pagar una carta para recuperar la Estructura.`);
+    announceOutcome(`${outcome} ${attacker.name} puede pagar una carta para recuperar la Estructura.`);
     return;
   }
 
@@ -1361,6 +1585,12 @@ function acceptExpiredDefense(state: GameState, playerId: string): void {
   combat.revealed = true;
   resolveCombat(state);
   addLog(state, `${defender.name} no respondió en 30 segundos y acepta el ataque sin defenderse.`);
+  addAnnouncement(
+    state,
+    defender.id,
+    `${defender.name} no respondió a tiempo. Se resuelve el ataque sin defensa.`,
+    [combat.attack.cardId, ...combat.attackSupports.map((card) => card.cardId)],
+  );
 }
 
 function finishCombat(state: GameState): void {
@@ -1406,18 +1636,6 @@ function chooseDefense(
   combat.defenseSupports = supports;
   combat.defenseExpiresAt = null;
   combat.revealed = true;
-  if (command.spyInstanceId) {
-    const spy = player.hand.find((card) => card.instanceId === command.spyInstanceId);
-    if (!spy || spy.cardId !== "action-spy") throw new RuleError("Espía de Ventana no está en tu mano.");
-    removeFromHand(player, spy.instanceId);
-    beginResponseWindow(state, {
-      id: randomUUID(),
-      actorId: player.id,
-      card: spy,
-      choices: { combatAfterSpy: true },
-    });
-    return;
-  }
   resolveCombat(state);
 }
 
@@ -1435,6 +1653,12 @@ function redirectAttack(
   }
   const card = player.hand.find((candidate) => candidate.instanceId === command.cardInstanceId);
   if (!card || card.cardId !== "object-mouse") throw new RuleError("Ratón con Hierba Gatuna no está en tu mano.");
+  if (
+    command.targetPlayerId === combat.targetPlayerId &&
+    command.targetCardInstanceId === combat.targetCardInstanceId
+  ) {
+    throw new RuleError("Elige otro objetivo distinto del que ya estaba siendo atacado.");
+  }
   validateTarget(state, combat.attackerId, command.targetPlayerId, command.targetCardInstanceId);
   removeFromHand(player, card.instanceId);
   const pending: PendingEffect = {
@@ -1475,6 +1699,7 @@ function revealAttack(
   if (state.phase !== "combat" || !combat || combat.targetPlayerId !== player.id) {
     throw new RuleError("Solo el defensor puede consultar este ataque.");
   }
+  if (combat.revealed) throw new RuleError("El Ataque ya se ha revelado.");
   if (command.method === "nosy") {
     if (hasActiveEffect(state, "nap") || !activeEffectTargets(player, "cat-nosy")) {
       throw new RuleError("No tienes un Gato Cotilla activo.");
@@ -1484,10 +1709,35 @@ function revealAttack(
       discardFromHand(state, player, removeFromHand(player, command.cardInstanceId));
     }
   } else {
-    throw new RuleError("Espía se juega junto con la elección de defensa.");
+    if (!command.cardInstanceId) throw new RuleError("Elige Espía de Ventana en tu mano.");
+    const spy = player.hand.find((candidate) =>
+      candidate.instanceId === command.cardInstanceId && candidate.cardId === "action-spy",
+    );
+    if (!spy) throw new RuleError("Espía de Ventana no está en tu mano.");
+    removeFromHand(player, spy.instanceId);
+    combat.defenseExpiresAt = null;
+    beginResponseWindow(state, {
+      id: randomUUID(),
+      actorId: player.id,
+      card: spy,
+      choices: {},
+    });
+    addAnnouncement(state, player.id, `${player.name} juega Espía de Ventana.`, [spy.cardId]);
+    return;
   }
   combat.revealed = true;
+  combat.attackDamage = calculateAttackDamage(state, combat);
   addLog(state, `${player.name} revela el Ataque y sus Apoyos.`);
+  addAnnouncement(
+    state,
+    player.id,
+    `${player.name} revela el Ataque y sus Apoyos.`,
+    [
+      ...(command.method === "nosy" ? ["cat-nosy"] : []),
+      combat.attack.cardId,
+      ...combat.attackSupports.map((card) => card.cardId),
+    ],
+  );
 }
 
 function finishMovement(state: GameState): void {
@@ -1556,6 +1806,10 @@ function resolveDiscard(state: GameState, playerId: string, instanceIds: string[
   state.pendingDiscard = null;
   if (next === "end_turn") closeTurn(state);
   else if (next === "finish_combat") finishCombat(state);
+  else if (next === "resume_combat") {
+    if (state.combat) state.combat.defenseExpiresAt = Date.now() + DEFENSE_TIMEOUT_MS;
+    state.phase = "combat";
+  }
   else state.phase = "action";
 }
 
@@ -1579,14 +1833,38 @@ function resolveLitter(state: GameState, player: PlayerState, recoverId: string 
 function resolveCurrentCommand(state: GameState, playerId: string, command: GameCommand): void {
   if (state.phase === "finished") throw new RuleError("La partida ya ha terminado.");
 
-  const drawNotice = state.pendingDrawNotices[playerId];
-  if (drawNotice?.length) {
-    if (command.type === "acknowledge-draw") {
-      delete state.pendingDrawNotices[playerId];
+  const privateNotices = state.pendingPrivateNotices[playerId];
+  if (privateNotices?.length) {
+    if (command.type === "acknowledge-private-notice") {
+      privateNotices.shift();
+      if (privateNotices.length === 0) delete state.pendingPrivateNotices[playerId];
       return;
     }
-    if (command.type !== "choose-drawn-cats") {
-      throw new RuleError("Confirma primero las cartas que has robado.");
+    const timeSensitiveDecision =
+      state.responseWindow?.order[state.responseWindow.cursor] === playerId ||
+      state.combat?.targetPlayerId === playerId ||
+      state.combat?.redirectPlayerId === playerId;
+    if (!timeSensitiveDecision) {
+      throw new RuleError("Confirma primero el aviso pendiente.");
+    }
+  }
+  if (command.type === "acknowledge-private-notice") {
+    throw new RuleError("No tienes avisos pendientes.");
+  }
+
+  const drawNotices = state.pendingDrawNotices[playerId];
+  const drawNotice = drawNotices?.[0];
+  if (drawNotice) {
+    const isCat = getCard(drawNotice.card.cardId).kind === "cat";
+    if (command.type === "acknowledge-draw" && !isCat) {
+      drawNotices?.shift();
+      if (drawNotices?.length === 0) delete state.pendingDrawNotices[playerId];
+      return;
+    }
+    if (command.type !== "choose-drawn-cats" || !isCat) {
+      throw new RuleError(isCat
+        ? "Elige dónde colocar el gato que acabas de robar."
+        : "Confirma primero la carta que acabas de robar.");
     }
   } else if (command.type === "acknowledge-draw") {
     throw new RuleError("No tienes cartas robadas pendientes de confirmar.");
@@ -1616,6 +1894,7 @@ function resolveCurrentCommand(state: GameState, playerId: string, command: Game
   }
 
   if (
+    !state.pendingDiscard &&
     state.combat &&
     state.combat.defenseExpiresAt !== null &&
     state.combat.defenseExpiresAt <= Date.now()
@@ -1705,7 +1984,10 @@ export function applyGameCommand(state: GameState, playerId: string, command: Ga
     next.phase === "action" &&
     next.actionUsed &&
     next.actionsRemaining === 0 &&
-    (!currentPlayerId || !next.pendingDrawNotices[currentPlayerId])
+    (!currentPlayerId ||
+      (!next.pendingDrawNotices[currentPlayerId] &&
+        !next.pendingPrivateNotices[currentPlayerId] &&
+        !next.pendingCatPlacements[currentPlayerId]))
   ) {
     next.phase = "movement";
   }
@@ -1721,6 +2003,7 @@ export function expireCombatDefense(
   if (
     !combat ||
     state.responseWindow ||
+    state.pendingDiscard ||
     combat.targetPlayerId !== playerId ||
     combat.defenseExpiresAt !== expectedExpiresAt ||
     expectedExpiresAt > Date.now()

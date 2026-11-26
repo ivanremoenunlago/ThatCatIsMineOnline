@@ -3,9 +3,19 @@ import { CARD_BY_ID } from "../shared/card-catalog.js";
 import { SYNERGIES } from "../shared/synergies.js";
 import type {
   GameCommand,
+  PublicRoomListing,
   PrivateGameState,
   PublicGameState,
   PublicPlayerState,
+  RoomLobbyState,
+} from "../shared/game-types.js";
+import {
+  isValidRoomCode,
+  MAX_ROOM_PLAYERS,
+  MIN_ROOM_PLAYERS,
+  normalizeRoomCode,
+  ROOM_AUTO_START_DELAY_MS,
+  ROOM_CODE_LENGTH,
 } from "../shared/game-types.js";
 import "./style.css";
 
@@ -38,7 +48,9 @@ const socketUrl = import.meta.env.VITE_GAME_URL ?? "ws://127.0.0.1:2567";
 let account: { id: string; username: string; elo: number; gamesPlayed: number; theme: "light" | "dark" } | null = null;
 let token: string | null = null;
 let room: Room | null = null;
-let lobby: { players: Array<{ id: string; name: string }>; hostId: string | null } | null = null;
+let lobby: RoomLobbyState | null = null;
+let publicRooms: PublicRoomListing[] = [];
+let joiningRoom = false;
 let publicState: PublicGameState | null = null;
 let privateState: PrivateGameState | null = null;
 let selectedCardId = "";
@@ -48,8 +60,12 @@ let errorMessage = "";
 let noticeMessage = "";
 let responseCountdownInterval: number | null = null;
 let presenceInterval: number | null = null;
+let roomBrowserInterval: number | null = null;
 let idleSinceByPlayer: Record<string, number> = {};
 let matchHistory: Array<{ id: string; playedAt: string; winnerName: string; playerNames: string[] }> = [];
+let dismissedCombatResultId = "";
+let acknowledgedWinnerId = "";
+let showFinalRanking = false;
 
 const escapeHtml = (value: string): string =>
   value.replace(/[&<>"']/g, (character) => ({
@@ -105,18 +121,24 @@ function showDiscardPile(): void {
   if (!discardUi.dialog.open) discardUi.dialog.showModal();
 }
 
-function showSynergies(playerId: string): void {
+function showSynergies(playerId: string, showAll = false): void {
   const player = publicState?.players.find((candidate) => candidate.id === playerId);
-  if (!player) return;
-  const active = SYNERGIES.filter((synergy) => player.activeSynergies.includes(synergy.id));
-  synergyUi.title.textContent = `Sinergias activas de ${playerId === account?.id ? "tu casa" : player.name}`;
-  synergyUi.list.innerHTML = active.length
-    ? active.map((synergy) => {
-      const cats = player.sofa.filter((cat) => synergy.cats.includes(cat.cardId));
+  if (!player && !showAll) return;
+  const synergies = showAll
+    ? SYNERGIES
+    : SYNERGIES.filter((synergy) => player?.activeSynergies.includes(synergy.id));
+  synergyUi.title.textContent = showAll
+    ? "Todas las sinergias posibles"
+    : `Sinergias activas de ${playerId === account?.id ? "tu casa" : player?.name ?? ""}`;
+  synergyUi.list.innerHTML = synergies.length
+    ? synergies.map((synergy) => {
+      const cats = showAll
+        ? synergy.cats
+        : player?.sofa.filter((cat) => synergy.cats.includes(cat.cardId)).map((cat) => cat.cardId) ?? [];
       return `<article class="synergy-card">
         <h3>${escapeHtml(synergy.name)}</h3>
         <p>${escapeHtml(synergy.description)}</p>
-        <div class="synergy-cats">${cats.map((cat) => cardTile(cat.cardId, cardName(cat.cardId))).join("")}</div>
+        <div class="synergy-cats">${cats.map((cardId) => cardTile(cardId, cardName(cardId))).join("")}</div>
       </article>`;
     }).join("")
     : `<p class="empty">No tiene sinergias activas en este momento.</p>`;
@@ -188,7 +210,7 @@ function renderLogin(): void {
       <section class="login-card">
         <p class="eyebrow">Partidas locales · 2–5 jugadores</p>
         <h1>¡Ese gato es mío!</h1>
-        <p>Entra con uno de los perfiles de prueba para crear o unirte a la sala.</p>
+        <p>Inicia sesión con uno de los perfiles de prueba para ver las salas disponibles.</p>
         <form id="login-form">
           <label>Perfil
             <select name="username">
@@ -198,7 +220,7 @@ function renderLogin(): void {
           <label>Contraseña
             <input name="password" type="password" value="gato123" required autocomplete="current-password" />
           </label>
-          <button class="primary" type="submit">Entrar en la sala</button>
+          <button class="primary" type="submit">Iniciar sesión</button>
         </form>
         <p class="hint">Perfiles de prueba: gato1–gato5 · contraseña: gato123</p>
         ${renderMessages()}
@@ -225,26 +247,120 @@ function renderMessages(): string {
     ${noticeMessage ? `<p class="message">${escapeHtml(noticeMessage)}</p>` : ""}`;
 }
 
-function renderLobby(): void {
-  if (!lobby || !account) return;
+function renderTopbar(): string {
+  if (!account) return "";
+  return `<header class="topbar"><h1>¡Ese gato es mío!</h1>
+    <div class="profile"><button data-action="toggle-theme" class="quiet">Tema ${account.theme === "dark" ? "oscuro" : "claro"} · cambiar</button>
+      <button data-action="logout" class="quiet">Salir</button></div></header>`;
+}
+
+function renderPublicRooms(): string {
+  if (publicRooms.length === 0) {
+    return `<p class="empty">No hay salas públicas abiertas. ¡Crea una para empezar!</p>`;
+  }
+  return `<ul class="room-list">${publicRooms.map((listedRoom) => {
+    const full = listedRoom.playerCount >= listedRoom.maxPlayers;
+    const countdown = listedRoom.autoStartAt === null
+      ? "Empieza al llenarse o cuando lo decida el creador"
+      : `<span data-room-countdown="${listedRoom.autoStartAt}"></span>`;
+    return `<li class="room-entry">
+      <div class="room-entry-info">
+        <strong>${escapeHtml(listedRoom.creatorName)} · ${listedRoom.playerCount}/${listedRoom.maxPlayers}</strong>
+        <span>Código ${escapeHtml(listedRoom.roomCode)} · ${countdown}</span>
+      </div>
+      <button class="primary" data-action="join-room" data-room-id="${escapeHtml(listedRoom.roomId)}"
+        data-room-code="${escapeHtml(listedRoom.roomCode)}" ${full ? "disabled" : ""}>
+        ${full ? "Sala llena" : "Unirse"}
+      </button>
+    </li>`;
+  }).join("")}</ul>`;
+}
+
+function renderRoomBrowser(): void {
+  if (!account) return;
   root!.innerHTML = `
-    <main class="lobby-shell">
-      <header class="topbar"><h1>¡Ese gato es mío!</h1>
-        <div class="profile"><button data-action="toggle-theme" class="quiet">Tema ${account.theme === "dark" ? "oscuro" : "claro"} · cambiar</button>
-          <button data-action="logout" class="quiet">Salir</button></div></header>
-      <section class="panel">
-        <p class="eyebrow">Sala local</p>
-        <h2>Jugadores (${lobby.players.length}/5)</h2>
-        <ul class="player-list">${lobby.players.map((player, index) =>
-          `<li><span>${escapeHtml(player.name)}${player.id === lobby!.hostId ? " · anfitrión" : ""}</span><b>${index + 1}</b></li>`,
-        ).join("")}</ul>
-        <p class="hint">Abre esta dirección en otros navegadores o dispositivos de la red local y entra con otro perfil.</p>
-        ${lobby.hostId === account.id
-          ? `<button class="primary" data-action="start" ${lobby.players.length < 2 ? "disabled" : ""}>Empezar partida</button>`
-          : `<p class="hint">El anfitrión empezará cuando todos estén listos.</p>`}
+    <main class="room-browser-shell">
+      ${renderTopbar()}
+      <section class="panel room-browser">
+        <div class="room-browser-heading">
+          <div><p class="eyebrow">Juega con otras personas</p><h2>Salas actuales</h2></div>
+          <button class="quiet" data-action="refresh-rooms">Actualizar</button>
+        </div>
+        <section class="room-create">
+          <h3>Crear sala</h3>
+          <form id="create-room-form" class="room-form">
+            <label>Máximo de jugadores
+              <select name="maxPlayers">
+                ${Array.from({ length: MAX_ROOM_PLAYERS - MIN_ROOM_PLAYERS + 1 }, (_, index) => {
+                  const capacity = MIN_ROOM_PLAYERS + index;
+                  return `<option value="${capacity}" ${capacity === MAX_ROOM_PLAYERS ? "selected" : ""}>${capacity} jugadores</option>`;
+                }).join("")}
+              </select>
+            </label>
+            <label class="inline room-private">
+              <input type="checkbox" name="isPrivate" />
+              Sala privada (solo visible con código)
+            </label>
+            <button class="primary" type="submit">Crear sala</button>
+          </form>
+        </section>
+        <section class="room-list-section">
+          <h3>Salas públicas</h3>
+          <div id="public-room-list">${renderPublicRooms()}</div>
+        </section>
+        <section class="room-code-section">
+          <h3>Unirse con código</h3>
+          <form id="join-code-form" class="room-form">
+            <label>Código de sala
+              <input name="code" type="text" minlength="${ROOM_CODE_LENGTH}" maxlength="${ROOM_CODE_LENGTH}"
+                pattern="[A-Za-z0-9]{${ROOM_CODE_LENGTH}}" autocomplete="off" autocapitalize="characters"
+                placeholder="Ej. RTBS" required />
+            </label>
+            <button class="primary" type="submit">Unirse por código</button>
+          </form>
+        </section>
         ${renderMessages()}
       </section>
     </main>`;
+}
+
+function renderRoomLobby(): void {
+  if (!lobby || !account) return;
+  root!.innerHTML = `
+    <main class="lobby-shell">
+      ${renderTopbar()}
+      <section class="panel room-lobby">
+        <p class="eyebrow">${lobby.isPrivate ? "Sala privada" : "Sala pública"}</p>
+        <div class="room-lobby-heading"><h2>Esperando jugadores</h2>
+          <button class="quiet" data-action="leave-room">Volver a salas</button></div>
+        <div class="room-code-display"><span>Código para invitar</span><strong>${escapeHtml(lobby.roomCode)}</strong></div>
+        <p class="hint">Comparte este código para que otras personas se unan. La partida empieza ${ROOM_AUTO_START_DELAY_MS / 1_000} segundos después de llenarse.</p>
+        <h3>Jugadores (${lobby.players.length}/${lobby.maxPlayers})</h3>
+        <ul class="player-list">${lobby.players.map((player, index) =>
+          `<li><span>${escapeHtml(player.name)}${player.id === lobby!.creatorId ? " · creador" : ""}</span>
+            <span class="room-player-actions"><b>${index + 1}</b>
+              ${account!.id === lobby!.creatorId && player.id !== lobby!.creatorId
+                ? `<button class="quiet" data-action="kick-player" data-player-id="${escapeHtml(player.id)}">Expulsar</button>`
+                : ""}
+            </span>
+          </li>`,
+        ).join("")}</ul>
+        ${lobby.autoStartAt !== null
+          ? `<p class="room-start-countdown" data-lobby-countdown="${lobby.autoStartAt}"></p>`
+          : `<p class="hint">${lobby.players.length === lobby.maxPlayers
+            ? "La cuenta atrás de inicio está en curso."
+            : "El creador puede iniciar manualmente cuando haya al menos 2 jugadores."}</p>`}
+        ${account.id === lobby.creatorId
+          ? `<button class="primary" data-action="start" ${lobby.players.length < MIN_ROOM_PLAYERS ? "disabled" : ""}>Empezar ahora</button>`
+          : `<p class="hint">El creador puede iniciar la partida cuando haya al menos 2 jugadores.</p>`}
+        ${renderMessages()}
+      </section>
+    </main>`;
+}
+
+function renderConnecting(): void {
+  root!.innerHTML = `<main class="lobby-shell"><section class="panel"><p class="eyebrow">Sala</p>
+    <h2>Conectando…</h2><p>Un momento, estamos preparando la sala.</p>${renderMessages()}</section></main>`;
 }
 
 function cardTile(cardId: string, name: string, status = ""): string {
@@ -374,18 +490,50 @@ function renderActionPanel(): string {
   if (!me) return "";
   const opponents = state.players.filter((player) => player.id !== account!.id);
   const myMovableCats = movableCats(me);
+  const combatResult = state.lastCombatResult;
+  if (combatResult && combatResult.id !== dismissedCombatResultId) {
+    const attackCards = [combatResult.attackCardId, ...combatResult.attackSupportCardIds];
+    const defenseCards = [
+      ...(combatResult.defenseCardId ? [combatResult.defenseCardId] : []),
+      ...combatResult.defenseSupportCardIds,
+    ];
+    const resultTitle = combatResult.succeeded ? "Ataque exitoso" : "Ataque fallido · defensa exitosa";
+    return interactionPopup(`<h2>${resultTitle}</h2>
+      <p>${escapeHtml(playerName(combatResult.attackerId))} contra ${escapeHtml(playerName(combatResult.defenderId))}</p>
+      <div class="combat-result">
+        <section><h3>Ataque · daño ${combatResult.attackDamage}</h3>
+          <div class="drawn-cards">${attackCards.map((cardId) => cardTile(cardId, cardName(cardId))).join("")}</div></section>
+        <section><h3>Objetivo</h3>${cardTile(combatResult.targetCardId, cardName(combatResult.targetCardId))}</section>
+        <section><h3>Defensa${combatResult.defenseDamage === null ? " · sin defensa" : ` · daño ${combatResult.defenseDamage}`}</h3>
+          <div class="drawn-cards">${defenseCards.map((cardId) => cardTile(cardId, cardName(cardId))).join("") || `<p class="empty">No se gastaron cartas de defensa.</p>`}</div></section>
+      </div>
+      <button class="primary" data-action="dismiss-combat-result" data-result-id="${escapeHtml(combatResult.id)}">Aceptar</button>`,
+    "combat-result-popup");
+  }
+  if (state.winnerId) {
+    if (acknowledgedWinnerId !== state.winnerId) {
+      return interactionPopup(`<h2>🏆 ${escapeHtml(playerName(state.winnerId))} gana la partida</h2>
+        <p>La partida ha terminado. Acepta para ver la clasificación final.</p>
+        <button class="primary" data-action="accept-game-over">Aceptar</button>`,
+      "game-over-popup");
+    }
+    if (showFinalRanking) {
+      const ranking = [...state.players].sort((left, right) =>
+        left.id === state.winnerId ? -1 : right.id === state.winnerId ? 1 : right.prestige - left.prestige,
+      );
+      return interactionPopup(`<h2>Clasificación final</h2>
+        <ol class="final-ranking">${ranking.map((player, index) => `<li>
+          <strong>${index + 1}. ${escapeHtml(player.name)}</strong>
+          <span>${player.prestige} de prestigio${player.id === state.winnerId ? " · Ganador" : ""}</span>
+        </li>`).join("")}</ol>
+        <button class="primary" data-action="back-to-menu">Volver al menú</button>`,
+      "final-ranking-popup");
+    }
+  }
   const selectedCard = privateState.hand.find((card) => card.instanceId === selectedCardId);
   const selectedDefinition = selectedCard ? CARD_BY_ID.get(selectedCard.cardId) : undefined;
   const selectedOpponentId = opponents[0]?.id ?? "";
   const targetPlayerOptions = selectOptions(opponents.map((player) => ({ id: player.id, label: player.name })), "Jugador objetivo");
-  const targetCats = (playerId: string) => {
-    const target = state.players.find((player) => player.id === playerId);
-    if (!target) return [];
-    return [
-      ...target.sofa.filter((cat) => !isProtectedCat(target, cat)),
-      ...target.salon.filter((cat) => !isProtectedCat(target, cat)),
-    ].map((cat) => ({ id: cat.instanceId, label: `${cardName(cat.cardId)} · ${cat.zone === "sofa" ? "Sofá" : "Salón"}` }));
-  };
   const laserOwners = laserEligibleOwners(state);
   const sofaOptions = selectOptions(me.sofa.map((cat) => ({ id: cat.instanceId, label: cardName(cat.cardId) })), "Gato del Sofá");
   const movableSofaOptions = selectOptions(
@@ -411,24 +559,40 @@ function renderActionPanel(): string {
     </label>`;
   }).join("")}</div>`;
 
-  if (privateState.pendingDrawNotice.length > 0) {
-    const cats = privateState.pendingCatPlacements;
-    const drawSummary = `<h2>Has robado ${privateState.pendingDrawNotice.length} carta${privateState.pendingDrawNotice.length === 1 ? "" : "s"}</h2>
-      <div class="drawn-cards">${privateState.pendingDrawNotice.map((card) =>
-        cardTile(card.cardId, cardName(card.cardId)),
-      ).join("")}</div>`;
-    if (cats.length > 0) {
+  const urgentResponse =
+    state.responseWindow?.recipientIds[state.responseWindow.cursor] === account.id ||
+    state.combat?.targetPlayerId === account.id ||
+    state.combat?.redirectPlayerId === account.id;
+  if (privateState.pendingPrivateNotice && !urgentResponse) {
+    const notice = privateState.pendingPrivateNotice;
+    return interactionPopup(`<h2>Notificación de la partida</h2>
+      <p>${escapeHtml(notice.text)}</p>
+      <div class="drawn-cards">${notice.cardIds.map((cardId) => cardTile(cardId, cardName(cardId))).join("")}</div>
+      <button class="primary" data-action="acknowledge-private-notice">Aceptar</button>`, "private-notice-popup");
+  }
+
+  if (privateState.pendingDrawNotice) {
+    const notice = privateState.pendingDrawNotice;
+    const isCat = CARD_BY_ID.get(notice.card.cardId)?.kind === "cat";
+    const cat = privateState.pendingCatPlacements.find((pending) => pending.instanceId === notice.card.instanceId);
+    const drawSummary = `<h2>Has robado ${escapeHtml(cardName(notice.card.cardId))}</h2>
+      <p class="draw-reason">Motivo: ${escapeHtml(notice.reason)}</p>
+      ${isCat && cat ? "" : `<div class="drawn-cards">${cardTile(notice.card.cardId, cardName(notice.card.cardId))}</div>`}`;
+    if (isCat && cat) {
       return interactionPopup(`${drawSummary}
-        <p>Elige dónde colocar cada gato. La acción continuará al confirmar.</p>
+        <p>Elige ahora dónde colocar este gato.</p>
         ${renderCatPlacementFields(
           "drawn-cat-placement-form",
-          cats,
+          [cat],
           (cat) => canFitCatOnSofa(me, cat.cardId),
-          "Confirmar cartas y colocación",
+          "Colocar gato y continuar",
         )}`, "draw-popup");
     }
+    if (isCat) {
+      return interactionPopup(`${drawSummary}<p>No se pudo encontrar el gato pendiente de colocar.</p>`, "draw-popup");
+    }
     return interactionPopup(`${drawSummary}
-      <p>Confirma para continuar con tu turno.</p>
+      <p>Confirma para continuar con el siguiente robo.</p>
       <button class="primary" data-action="acknowledge-draw">Aceptar</button>`, "draw-popup");
   }
 
@@ -547,9 +711,16 @@ function renderActionPanel(): string {
   if (state.responseWindow) {
     const window = state.responseWindow;
     const canRespond = window.recipientIds[window.cursor] === account.id;
+    const pendingActor = state.players.find((player) => player.id === window.pendingActorId);
+    const victimistPunishment = pendingActor?.sofa.some((cat) => cat.cardId === "cat-victim") &&
+      !state.activeEffects.some((effect) => effect.kind === "nap") &&
+      CARD_BY_ID.get(window.pendingCardId)?.kind === "action" &&
+      (window.stackLength + 1) % 2 === 1;
     if (!canRespond && window.pendingActorId === account.id) {
       return interactionPopup(`<h2>Flús-Flús pendiente 💦</h2>
-        <p>Has jugado ${escapeHtml(cardName(window.pendingCardId))}. Esperando la respuesta de ${escapeHtml(playerName(window.recipientIds[window.cursor] ?? ""))}.</p>
+        <p>Has jugado ${escapeHtml(cardName(window.pendingCardId))}.</p>
+        ${cardTile(window.pendingCardId, cardName(window.pendingCardId))}
+        <p>Esperando la respuesta de ${escapeHtml(playerName(window.recipientIds[window.cursor] ?? ""))}.</p>
         <p class="response-countdown">Tiempo para responder: <strong data-countdown="${window.expiresAt}">15</strong> s</p>`,
       "flush-popup");
     }
@@ -559,10 +730,12 @@ function renderActionPanel(): string {
     return `<dialog id="response-popup" class="interaction-popup response-popup flush-popup ${state.combat?.targetPlayerId === account.id ? "attack-popup" : ""}" aria-labelledby="response-popup-title">
       <h2 id="response-popup-title">Respuesta de Flús-Flús 💦</h2>
       <p>${escapeHtml(playerName(window.actorId))} ha jugado ${escapeHtml(cardName(window.cardId))}. Puedes cancelarla antes de que se resuelva.</p>
+      ${cardTile(window.cardId, cardName(window.cardId))}
+      ${victimistPunishment ? `<p class="victimist-warning">⚠️ ${escapeHtml(pendingActor?.name ?? "El jugador")} tiene Gato Victimista: si cancelas esta Acción, tendrás que elegir una carta adicional para descartar.</p>` : ""}
       <p class="response-countdown">Tiempo para responder: <strong data-countdown="${window.expiresAt}">${remaining}</strong> s</p>
       ${flush.length
         ? `<div class="response-options">${flush.map((card) =>
-          `<button class="primary" data-action="flush" data-card="${escapeHtml(card.instanceId)}">Cancelar con Flús-Flús</button>`,
+          `<button class="primary" data-action="flush" data-card="${escapeHtml(card.instanceId)}">${cardTile(card.cardId, cardName(card.cardId))}Cancelar con Flús-Flús</button>`,
         ).join("")}</div>`
         : `<p class="response-no-card">No tienes Flús-Flús en la mano. Puedes pasar ahora o dejar que se agote el tiempo.</p>`}
       <button class="quiet" data-action="pass-response">Pasar sin gastar carta</button></dialog>`;
@@ -571,10 +744,11 @@ function renderActionPanel(): string {
   if (state.combat) {
     if (privateState.redirectAvailable) {
       const mouse = privateState.hand.find((card) => card.cardId === "object-mouse");
+      const redirectPlayers = state.players.filter((player) => player.id !== state.combat?.attackerId);
       return `<dialog id="response-popup" class="interaction-popup response-popup attack-popup" aria-labelledby="response-popup-title">
         <h2 id="response-popup-title">¡Te están atacando!</h2>
-        <p>Un rival ataca tu ${escapeHtml(cardName(findTargetCard(state, state.combat.targetCardInstanceId)?.cardId ?? ""))}. Puedes cambiar el objetivo con Ratón con Hierba Gatuna o pasar a la defensa.</p>
-        ${renderTargetControls(opponents, state, selectedOpponentId)}
+        <p>Un rival ataca tu ${escapeHtml(cardName(findTargetCard(state, state.combat.targetCardInstanceId)?.cardId ?? ""))}. Puedes desviar el ataque a otro gato o Estructura válida, nunca al atacante ni al objetivo actual.</p>
+        ${renderTargetControls(redirectPlayers, state, account.id)}
         ${mouse ? `<button class="primary" data-action="redirect" data-card="${escapeHtml(mouse.instanceId)}">Desviar con Ratón con Hierba Gatuna</button>` : ""}
         <p class="response-countdown">Responde antes de <strong data-countdown="${state.combat.defenseExpiresAt}">30</strong> s.</p>
         <button class="quiet" data-action="pass-redirect">Pasar a la defensa</button></dialog>`;
@@ -583,23 +757,46 @@ function renderActionPanel(): string {
       const attacks = privateState.hand.filter((card) => CARD_BY_ID.get(card.cardId)?.kind === "attack");
       const supports = privateState.hand.filter((card) => CARD_BY_ID.get(card.cardId)?.kind === "support");
       const spy = privateState.hand.find((card) => card.cardId === "action-spy");
-      const nosy = me.sofa.some((cat) => cat.cardId === "cat-nosy");
+      const nosy = !state.activeEffects.some((effect) => effect.kind === "nap") &&
+        me.sofa.some((cat) => cat.cardId === "cat-nosy");
+      const informationPartners = me.activeSynergies.includes("information-partners");
+      const revealedAttack = state.combat.attackCardIds;
       return `<dialog id="response-popup" class="interaction-popup response-popup attack-popup" aria-labelledby="response-popup-title">
         <h2 id="response-popup-title">¡Te están atacando!</h2>
         <p>Un rival ataca tu ${escapeHtml(cardName(findTargetCard(state, state.combat.targetCardInstanceId)?.cardId ?? ""))}.</p>
+        ${state.combat.revealed
+          ? `<section class="revealed-attack"><h3>Ataque revelado · daño ${state.combat.attackDamage ?? "?"}</h3>
+              <div class="drawn-cards">${revealedAttack.map((cardId) => cardTile(cardId, cardName(cardId))).join("")}</div></section>`
+          : `<section class="reveal-options"><h3>Antes de elegir defensa</h3>
+              ${spy ? `<button class="quiet" data-action="spy" data-card="${escapeHtml(spy.instanceId)}">${cardTile(spy.cardId, cardName(spy.cardId))}Revelar con Espía de Ventana</button>` : ""}
+              ${nosy ? `<div class="reveal-choice"><p>Cotilla ${informationPartners ? "(sin coste)" : "(descartas una carta)"}</p>
+                ${informationPartners ? "" : `<select name="nosy-cost">${selectOptions(privateState.hand.map((card) => ({ id: card.instanceId, label: cardName(card.cardId) })), "Carta a descartar")}</select>`}
+                <button class="quiet" data-action="reveal-nosy">${cardTile("cat-nosy", "Gato Cotilla")}Revelar con Cotilla</button></div>` : ""}
+              ${!spy && !nosy ? `<p>El ataque no está revelado. Puedes elegir una defensa o aceptar sin defenderte.</p>` : ""}
+            </section>`}
         ${attacks.length
-          ? `<label>Defensa<select name="defense-card">${selectOptions(attacks.map((card) => ({ id: card.instanceId, label: cardName(card.cardId) })), "Aceptar ataque sin defenderte")}</select></label>
-            ${supports.map((card) => `<label class="inline"><input type="checkbox" name="defense-support" value="${escapeHtml(card.instanceId)}" />${escapeHtml(cardName(card.cardId))}</label>`).join("")}
-            ${spy ? `<label class="inline"><input type="checkbox" name="use-spy" />Usar Espía después de elegir</label>` : ""}`
+          ? `<fieldset class="defense-options"><legend>Elige defensa (puedes aceptar sin gastar)</legend>
+              <label class="defense-card-choice"><input type="radio" name="defense-card" value="" checked />Aceptar ataque</label>
+              ${attacks.map((card) => `<label class="defense-card-choice">
+                <input type="radio" name="defense-card" value="${escapeHtml(card.instanceId)}" />
+                ${cardTile(card.cardId, cardName(card.cardId))}</label>`).join("")}
+            </fieldset>
+            ${supports.length ? `<fieldset class="defense-options"><legend>Apoyos de defensa</legend>
+              ${supports.map((card) => `<label class="defense-card-choice">
+                <input type="checkbox" name="defense-support" value="${escapeHtml(card.instanceId)}" />
+                ${cardTile(card.cardId, cardName(card.cardId))}</label>`).join("")}
+            </fieldset>` : ""}`
           : `<p class="attack-unavailable">No tienes una carta de Ataque para defenderte. Elige cuándo aceptar el ataque.</p>`}
-        ${nosy ? `<label class="inline"><input type="checkbox" name="use-nosy" />Revelar el ataque con Cotilla</label>
-          <label>Coste de Cotilla<select name="nosy-cost">${selectOptions(privateState.hand.map((card) => ({ id: card.instanceId, label: cardName(card.cardId) })), "Carta a descartar")}</select></label>` : ""}
         <p class="response-countdown">Responde antes de <strong data-countdown="${state.combat.defenseExpiresAt}">30</strong> s.</p>
         <button class="primary" data-action="defend">${attacks.length ? "Confirmar respuesta" : "Aceptar ataque"}</button></dialog>`;
     }
     if (state.combat.attackerId === account.id) {
       return interactionPopup(`<h2>Ataque en curso</h2>
         <p>Tu ataque contra ${escapeHtml(playerName(state.combat.targetPlayerId))} está esperando una respuesta.</p>
+        <section class="revealed-attack"><h3>Tus cartas · daño ${privateState.privateAttackDamage ?? "?"}</h3>
+          <div class="drawn-cards">${privateState.privateCombatCards.map((card) =>
+            cardTile(card.cardId, cardName(card.cardId)),
+          ).join("")}</div></section>
         <p class="response-countdown">La respuesta vence en <strong data-countdown="${state.combat.defenseExpiresAt}">30</strong> s.</p>`,
       "attack-popup");
     }
@@ -675,10 +872,11 @@ function renderActionPanel(): string {
   </section>`;
 }
 
-function renderTargetControls(opponents: PublicPlayerState[], state: PublicGameState, defaultTarget: string): string {
-  return `<label>Jugador objetivo<select name="target-player">${selectOptions(opponents.map((player) => ({ id: player.id, label: player.name })), "Elige rival")}</select></label>
-    <label>Objetivo<select name="target-card" data-default-target="${escapeHtml(defaultTarget)}">
-      ${selectOptions(targetCats(state, defaultTarget), "Gato o Estructura")}</select></label>`;
+function renderTargetControls(players: PublicPlayerState[], state: PublicGameState, defaultTarget: string): string {
+  const initialTarget = players.find((player) => player.id === defaultTarget) ?? players[0];
+  return `<label>Casa objetivo<select name="target-player">${selectOptions(players.map((player) => ({ id: player.id, label: player.name })), "Elige casa")}</select></label>
+    <label>Gato o Estructura<select name="target-card" data-default-target="${escapeHtml(initialTarget?.id ?? "")}">
+      ${selectOptions(initialTarget ? redirectTargetCats(state, initialTarget.id) : [], "Elige un objetivo")}</select></label>`;
 }
 
 function renderMultiHandControls(hand: PrivateGameState["hand"]): string {
@@ -705,6 +903,22 @@ function targetCats(
     cats.push({ id: target.structure.instanceId, label: cardName(target.structure.cardId) });
   }
   return cats;
+}
+
+function redirectTargetCats(state: PublicGameState, playerId: string): Array<{ id: string; label: string }> {
+  const target = state.players.find((player) => player.id === playerId);
+  const combat = state.combat;
+  if (!target || !combat || target.id === combat.attackerId) return [];
+  const currentTarget = (instanceId: string) =>
+    combat.targetPlayerId === target.id && combat.targetCardInstanceId === instanceId;
+  const cats = target.structure?.cardId === "structure-box" || target.structure?.cardId === "structure-fortress"
+    ? []
+    : targetCats(state, playerId, false).filter((cat) => !currentTarget(cat.id));
+  const structure = target.structure && target.structure.cardId !== "structure-bed" &&
+    !currentTarget(target.structure.instanceId)
+    ? [{ id: target.structure.instanceId, label: `${cardName(target.structure.cardId)} · Estructura` }]
+    : [];
+  return [...cats, ...structure];
 }
 
 function catOptionsForPlayer(state: PublicGameState, playerId: string): Array<{ id: string; label: string }> {
@@ -878,7 +1092,12 @@ function renderGame(): void {
           <button data-action="logout" class="quiet">Salir</button></div>
       </header>
       ${publicState.activeEffects.map((effect) => `<p class="effect-banner">${effect.kind === "nap" ? "Hora de la Siesta: habilidades anuladas" : "Huelga: movimientos bloqueados"}</p>`).join("")}
-      ${publicState.winnerId ? `<section class="winner">🏆 ${escapeHtml(playerName(publicState.winnerId))} gana la partida</section>` : ""}
+      ${publicState.announcement ? `<section class="event-announcement" role="status">
+        <div class="announcement-cards">${publicState.announcement.cardIds.map((cardId) =>
+          cardPreviewTrigger(cardId, cardName(cardId)),
+        ).join("")}</div>
+        <p>${escapeHtml(publicState.announcement.text)}</p>
+      </section>` : ""}
       <section class="discard-summary panel">
         <div><h3>Descarte · ${publicState.discardCount}</h3>
           ${topDiscard
@@ -889,12 +1108,10 @@ function renderGame(): void {
       </section>
       ${opponents.length ? `<section class="opponents-board"><h2>Rivales</h2>
         <div class="opponents-grid">${opponents.map(renderBoardPlayer).join("")}</div></section>` : ""}
+      <button class="quiet all-synergies-button" data-action="all-synergies">Consultar todas las sinergias</button>
       <section class="own-board"><h2>Tu tablero</h2>${renderBoardPlayer(me)}</section>
       ${renderActionPanel()}
       <section class="panel"><h3>Registro de partida</h3><ol class="log">${publicState.log.slice(-12).reverse().map((entry) => `<li>${escapeHtml(entry.text)}</li>`).join("")}</ol></section>
-      ${publicState.winnerId ? `<section class="panel"><h3>Partidas recientes</h3>${matchHistory.map((match) =>
-        `<p>${escapeHtml(match.playedAt.slice(0, 10))} · ${escapeHtml(match.winnerName)} ganó (${match.playerNames.map(escapeHtml).join(", ")})</p>`,
-      ).join("") || `<p class="hint">Cargando historial…</p>`}</section>` : ""}
       ${renderMessages()}
     </main>`;
   const popup = root!.querySelector<HTMLDialogElement>(".interaction-popup");
@@ -905,27 +1122,82 @@ function renderGame(): void {
   updatePresenceBadges();
 }
 
+function stopRoomBrowserPolling(): void {
+  if (roomBrowserInterval !== null) window.clearInterval(roomBrowserInterval);
+  roomBrowserInterval = null;
+}
+
+function updateRoomCountdowns(): void {
+  const now = Date.now();
+  for (const element of root!.querySelectorAll<HTMLElement>("[data-room-countdown]")) {
+    const startsAt = Number(element.dataset.roomCountdown);
+    const seconds = Math.max(0, Math.ceil((startsAt - now) / 1_000));
+    element.textContent = `Empieza en ${seconds} s`;
+  }
+  for (const element of root!.querySelectorAll<HTMLElement>("[data-lobby-countdown]")) {
+    const startsAt = Number(element.dataset.lobbyCountdown);
+    const seconds = Math.max(0, Math.ceil((startsAt - now) / 1_000));
+    element.textContent = `La partida empieza en ${seconds} s.`;
+  }
+}
+
+function scheduleCountdownUpdates(): void {
+  if (responseCountdownInterval !== null) window.clearInterval(responseCountdownInterval);
+  responseCountdownInterval = null;
+  const update = () => {
+    const now = Date.now();
+    for (const element of root!.querySelectorAll<HTMLElement>("[data-countdown]")) {
+      const expiresAt = Number(element.dataset.countdown);
+      element.textContent = String(Math.max(0, Math.ceil((expiresAt - now) / 1_000)));
+    }
+    updateRoomCountdowns();
+  };
+  if (root!.querySelector("[data-countdown], [data-room-countdown], [data-lobby-countdown]")) {
+    update();
+    responseCountdownInterval = window.setInterval(update, 250);
+  }
+}
+
+async function refreshPublicRooms(): Promise<void> {
+  if (!account || room || joiningRoom || publicState) return;
+  try {
+    const response = await fetch(`${apiUrl}/api/rooms`);
+    const result = await response.json() as { rooms?: PublicRoomListing[]; error?: string };
+    if (!response.ok || !Array.isArray(result.rooms)) {
+      throw new Error(result.error ?? "No se pudieron cargar las salas públicas.");
+    }
+    if (!account || room || joiningRoom || publicState) return;
+    publicRooms = result.rooms;
+    const listing = root!.querySelector<HTMLDivElement>("#public-room-list");
+    if (listing) {
+      listing.innerHTML = renderPublicRooms();
+      scheduleCountdownUpdates();
+    }
+  } catch (error) {
+    if (account && !room && !joiningRoom && !publicState) setError(error);
+  }
+}
+
+function startRoomBrowserPolling(): void {
+  if (roomBrowserInterval !== null) return;
+  void refreshPublicRooms();
+  roomBrowserInterval = window.setInterval(() => void refreshPublicRooms(), 2_000);
+}
+
 function render(): void {
   root!.classList.toggle(
     "attack-pending",
     Boolean(publicState?.combat && !publicState.responseWindow && publicState.combat.targetPlayerId === account?.id),
   );
   if (!account) renderLogin();
-  else if (!publicState) renderLobby();
-  else renderGame();
-  if (responseCountdownInterval !== null) window.clearInterval(responseCountdownInterval);
-  responseCountdownInterval = null;
-  const countdowns = [...root!.querySelectorAll<HTMLElement>("[data-countdown]")];
-  if (countdowns.length > 0) {
-    const updateCountdown = () => {
-      for (const element of root!.querySelectorAll<HTMLElement>("[data-countdown]")) {
-        const expiresAt = Number(element.dataset.countdown);
-        element.textContent = String(Math.max(0, Math.ceil((expiresAt - Date.now()) / 1_000)));
-      }
-    };
-    updateCountdown();
-    responseCountdownInterval = window.setInterval(updateCountdown, 250);
-  }
+  else if (joiningRoom) renderConnecting();
+  else if (lobby) renderRoomLobby();
+  else if (!publicState) {
+    renderRoomBrowser();
+    startRoomBrowserPolling();
+  } else renderGame();
+  if (!account || room || joiningRoom || publicState) stopRoomBrowserPolling();
+  scheduleCountdownUpdates();
   if (presenceInterval === null) {
     presenceInterval = window.setInterval(updatePresenceBadges, 1_000);
   }
@@ -945,18 +1217,38 @@ function send(command: GameCommand): void {
   room.send("command", command);
 }
 
-async function enterRoom(loginToken: string): Promise<void> {
-  const client = new Client(socketUrl);
-  room = await client.joinOrCreate("game", { token: loginToken });
-  room.onMessage("lobby", (message: typeof lobby) => {
-    if (message) lobby = message;
+async function connectToRoom(connect: () => Promise<Room>): Promise<void> {
+  if (!token) throw new Error("Inicia sesión antes de unirte a una sala.");
+  stopRoomBrowserPolling();
+  errorMessage = "";
+  noticeMessage = "";
+  joiningRoom = true;
+  lobby = null;
+  publicState = null;
+  privateState = null;
+  render();
+  let joined: Room;
+  try {
+    joined = await connect();
+  } catch (error) {
+    joiningRoom = false;
+    render();
+    throw error;
+  }
+  room = joined;
+  joined.onMessage("lobby", (message: RoomLobbyState) => {
+    if (room !== joined) return;
+    lobby = message;
+    joiningRoom = false;
     publicState = null;
     privateState = null;
     render();
   });
   room.onMessage("public-state", (message: PublicGameState) => {
+    if (room !== joined) return;
     const justFinished = Boolean(message.winnerId && !publicState?.winnerId);
     publicState = message;
+    joiningRoom = false;
     lobby = null;
     render();
     if (justFinished) {
@@ -971,24 +1263,64 @@ async function enterRoom(loginToken: string): Promise<void> {
     }
   });
   room.onMessage("private-state", (message: PrivateGameState) => {
+    if (room !== joined) return;
     privateState = message;
     render();
   });
   room.onMessage("presence", (message: { idleSinceByPlayer: Record<string, number> }) => {
+    if (room !== joined) return;
     idleSinceByPlayer = message.idleSinceByPlayer;
     updatePresenceBadges();
   });
   room.onMessage("error", (message: string) => {
+    if (room !== joined) return;
     errorMessage = message;
     render();
   });
   room.onMessage("notice", (message: string) => {
+    if (room !== joined) return;
     noticeMessage = message;
     render();
   });
-  room.send("refresh");
-  lobby = { players: [], hostId: null };
-  renderLobby();
+  room.onMessage("room-kicked", (message: string) => {
+    if (room !== joined) return;
+    noticeMessage = message;
+    room = null;
+    joiningRoom = false;
+    lobby = null;
+    publicState = null;
+    privateState = null;
+    void joined.leave();
+    render();
+  });
+  joined.onLeave(() => {
+    if (room !== joined) return;
+    room = null;
+    joiningRoom = false;
+    lobby = null;
+    publicState = null;
+    privateState = null;
+    render();
+  });
+  joined.send("refresh");
+}
+
+async function joinRoomByCode(value: string): Promise<void> {
+  const code = normalizeRoomCode(value);
+  if (!isValidRoomCode(code)) throw new Error(`El código debe tener ${ROOM_CODE_LENGTH} letras o números.`);
+  if (!token) throw new Error("Inicia sesión antes de unirte a una sala.");
+  const response = await fetch(`${apiUrl}/api/rooms/resolve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code }),
+  });
+  const result = await response.json() as { roomId?: string; error?: string };
+  if (!response.ok || !result.roomId) {
+    throw new Error(result.error ?? "No se pudo encontrar la sala.");
+  }
+  const roomId = result.roomId;
+  const client = new Client(socketUrl);
+  await connectToRoom(() => client.joinById(roomId, { token, code }));
 }
 
 function field(data: FormData, name: string): string {
@@ -1019,9 +1351,38 @@ root.addEventListener("submit", (event) => {
         token = result.token;
         account = result.account;
         applyTheme(account.theme);
-        await enterRoom(token);
+        errorMessage = "";
+        noticeMessage = "";
+        publicRooms = [];
+        render();
       })
       .catch(setError);
+    return;
+  }
+
+  if (form.id === "create-room-form") {
+    event.preventDefault();
+    if (!token) {
+      setError(new Error("Inicia sesión antes de crear una sala."));
+      return;
+    }
+    const data = new FormData(form);
+    const maxPlayers = Number(field(data, "maxPlayers"));
+    if (!Number.isInteger(maxPlayers) || maxPlayers < MIN_ROOM_PLAYERS || maxPlayers > MAX_ROOM_PLAYERS) {
+      form.reportValidity();
+      return;
+    }
+    const isPrivate = data.get("isPrivate") === "on";
+    errorMessage = "";
+    const client = new Client(socketUrl);
+    void connectToRoom(() => client.create("game", { token, maxPlayers, isPrivate })).catch(setError);
+    return;
+  }
+
+  if (form.id === "join-code-form") {
+    event.preventDefault();
+    errorMessage = "";
+    void joinRoomByCode(field(new FormData(form), "code")).catch(setError);
     return;
   }
 
@@ -1143,10 +1504,13 @@ root.addEventListener("change", (event) => {
     const cardSelect = root!.querySelector<HTMLSelectElement>('select[name="target-card"], select[name="targetCardInstanceId"]');
     const effect = root!.querySelector<HTMLFormElement>("#action-form")?.dataset.effect;
     if (cardSelect && publicState) {
+      const isRedirect = Boolean(root!.querySelector('[data-action="redirect"]'));
       const options = effect === "steal_living_room_cat"
         ? salonCatOptions(publicState, target.value)
+        : isRedirect
+          ? redirectTargetCats(publicState, target.value)
         : targetCats(publicState, target.value);
-      cardSelect.innerHTML = selectOptions(options, "Gato o Estructura");
+      cardSelect.innerHTML = selectOptions(options, isRedirect ? "Elige un objetivo" : "Gato o Estructura");
     }
   } else if (target instanceof HTMLSelectElement && target.name === "ownerId" && publicState) {
     const catSelect = root!.querySelector<HTMLSelectElement>('select[name="catInstanceId"]');
@@ -1174,11 +1538,15 @@ root.addEventListener("click", (event) => {
   const checked = (name: string) => [...root!.querySelectorAll<HTMLInputElement>(`input[name="${name}"]:checked`)].map((input) => input.value);
 
   if (action === "logout") {
-    room?.leave();
+    stopRoomBrowserPolling();
+    const activeRoom = room;
     room = null;
+    void activeRoom?.leave();
     account = null;
     token = null;
     applyTheme("light");
+    joiningRoom = false;
+    publicRooms = [];
     publicState = null;
     privateState = null;
     lobby = null;
@@ -1186,16 +1554,80 @@ root.addEventListener("click", (event) => {
     render();
   } else if (action === "toggle-theme") {
     void toggleTheme();
+  } else if (action === "refresh-rooms") {
+    void refreshPublicRooms();
+  } else if (action === "join-room") {
+    const roomId = button.dataset.roomId;
+    const code = button.dataset.roomCode;
+    if (!roomId || !code || !token) {
+      setError(new Error("No se pudo identificar la sala seleccionada."));
+      return;
+    }
+    const client = new Client(socketUrl);
+    void connectToRoom(() => client.joinById(roomId, { token, code })).catch(setError);
+  } else if (action === "leave-room") {
+    const activeRoom = room;
+    room = null;
+    lobby = null;
+    joiningRoom = false;
+    publicState = null;
+    privateState = null;
+    acknowledgedWinnerId = "";
+    showFinalRanking = false;
+    dismissedCombatResultId = "";
+    void activeRoom?.leave();
+    render();
+  } else if (action === "kick-player") {
+    const playerId = button.dataset.playerId;
+    if (playerId) room?.send("kick-player", { playerId });
   } else if (action === "show-discard") {
     showDiscardPile();
   } else if (action === "show-synergies") {
     showSynergies(button.dataset.playerId ?? "");
+  } else if (action === "all-synergies") {
+    showSynergies("", true);
   } else if (action === "start") {
     room?.send("start-game");
   } else if (action === "skip-actions") send({ type: "skip-action-phase" });
   else if (action === "finish-movement") send({ type: "finish-movement" });
   else if (action === "initial-draw") send({ type: "choose-initial-draw", useRaccoon: button.dataset.useRaccoon === "true" });
   else if (action === "acknowledge-draw") send({ type: "acknowledge-draw" });
+  else if (action === "acknowledge-private-notice") send({ type: "acknowledge-private-notice" });
+  else if (action === "dismiss-combat-result") {
+    dismissedCombatResultId = button.dataset.resultId ?? publicState?.lastCombatResult?.id ?? "";
+    render();
+  } else if (action === "accept-game-over") {
+    acknowledgedWinnerId = publicState?.winnerId ?? "";
+    showFinalRanking = true;
+    render();
+  } else if (action === "back-to-menu") {
+    const activeRoom = room;
+    room = null;
+    lobby = null;
+    publicState = null;
+    privateState = null;
+    acknowledgedWinnerId = "";
+    showFinalRanking = false;
+    dismissedCombatResultId = "";
+    void activeRoom?.leave();
+    render();
+  } else if (action === "spy") {
+    const cardInstanceId = button.dataset.card;
+    if (cardInstanceId) send({ type: "reveal-attack", method: "spy", cardInstanceId });
+  } else if (action === "reveal-nosy") {
+    const me = publicState?.players.find((player) => player.id === account?.id);
+    const hasInformationPartners = me?.activeSynergies.includes("information-partners") ?? false;
+    const cardInstanceId = fieldFromRoot("nosy-cost");
+    if (!hasInformationPartners && !cardInstanceId) {
+      setError(new Error("Elige la carta que descartas para revelar el Ataque con Cotilla."));
+      return;
+    }
+    send({
+      type: "reveal-attack",
+      method: "nosy",
+      ...(cardInstanceId ? { cardInstanceId } : {}),
+    });
+  }
   else if (action === "cancel-selection") {
     selectedCardId = "";
     selectedSupportIds.clear();
@@ -1227,18 +1659,10 @@ root.addEventListener("click", (event) => {
   else if (action === "flush") send({ type: "respond-flush", cardInstanceId: button.dataset.card ?? "" });
   else if (action === "pass-response") send({ type: "pass-response" });
   else if (action === "defend") {
-    const spy = root!.querySelector<HTMLInputElement>('input[name="use-spy"]')?.checked;
-    const spyCard = spy ? privateState?.hand.find((card) => card.cardId === "action-spy")?.instanceId : undefined;
-    const useNosy = root!.querySelector<HTMLInputElement>('input[name="use-nosy"]')?.checked;
-    const nosyCost = fieldFromRoot("nosy-cost");
-    if (useNosy) {
-      send({ type: "reveal-attack", method: "nosy", ...(nosyCost ? { cardInstanceId: nosyCost } : {}) });
-    }
     send({
       type: "choose-defense",
-      defenseInstanceId: fieldFromRoot("defense-card") || null,
+      defenseInstanceId: checked("defense-card")[0] || null,
       supportInstanceIds: checked("defense-support"),
-      ...(spyCard ? { spyInstanceId: spyCard } : {}),
     });
   } else if (action === "redirect") {
     const targetPlayerId = fieldFromRoot("target-player");

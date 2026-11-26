@@ -13,6 +13,19 @@ export type GamePhase =
   | "combat"
   | "finished";
 
+export const MIN_ROOM_PLAYERS = 2;
+export const MAX_ROOM_PLAYERS = 5;
+export const ROOM_CODE_LENGTH = 4;
+export const ROOM_AUTO_START_DELAY_MS = 10_000;
+
+export function normalizeRoomCode(value: string): string {
+  return value.trim().toUpperCase();
+}
+
+export function isValidRoomCode(value: string): boolean {
+  return new RegExp(`^[A-Z0-9]{${ROOM_CODE_LENGTH}}$`).test(value);
+}
+
 export type Zone = "sofa" | "salon";
 
 export interface BoardCat extends CardInstance {
@@ -73,6 +86,39 @@ export interface ResponseWindow {
   expiresAt: number;
 }
 
+export interface DrawNotice {
+  card: CardInstance;
+  reason: string;
+}
+
+export interface PrivateGameNotice {
+  id: string;
+  text: string;
+  cardIds: string[];
+}
+
+export interface GameAnnouncement {
+  id: string;
+  actorId: string | null;
+  text: string;
+  cardIds: string[];
+  createdAt: number;
+}
+
+export interface CombatResult {
+  id: string;
+  attackerId: string;
+  defenderId: string;
+  targetCardId: string;
+  attackCardId: string;
+  attackSupportCardIds: string[];
+  defenseCardId: string | null;
+  defenseSupportCardIds: string[];
+  attackDamage: number;
+  defenseDamage: number | null;
+  succeeded: boolean;
+}
+
 export interface CombatState {
   attackerId: string;
   initialTargetId: string;
@@ -83,6 +129,8 @@ export interface CombatState {
   attackSupports: CardInstance[];
   defense: CardInstance | null;
   defenseSupports: CardInstance[];
+  attackDamage: number | null;
+  defenseDamage: number | null;
   defenseExpiresAt: number | null;
   revealed: boolean;
   redirectedPlayers: string[];
@@ -94,7 +142,7 @@ export interface PendingDiscard {
   cursor: number;
   countByPlayer: Record<string, number>;
   reason: string;
-  next: "continue" | "end_turn" | "finish_combat";
+  next: "continue" | "end_turn" | "finish_combat" | "resume_combat";
   toLitter: boolean;
 }
 
@@ -135,8 +183,11 @@ export interface GameState {
   pendingChoices: Record<string, string>;
   initialCatChoices: Record<string, CardInstance[]>;
   pendingCatPlacements: Record<string, CardInstance[]>;
-  pendingDrawNotices: Record<string, CardInstance[]>;
+  pendingDrawNotices: Record<string, DrawNotice[]>;
+  pendingPrivateNotices: Record<string, PrivateGameNotice[]>;
   initialDrawChoicePlayerId: string | null;
+  announcement: GameAnnouncement | null;
+  lastCombatResult: CombatResult | null;
   winnerId: string | null;
   endedReason: "victory" | "cancelled" | null;
   log: GameLogEntry[];
@@ -158,6 +209,31 @@ export interface PublicPlayerState {
   activeSynergies: string[];
 }
 
+export interface LobbyPlayer {
+  id: string;
+  name: string;
+}
+
+export interface RoomLobbyState {
+  roomId: string;
+  roomCode: string;
+  isPrivate: boolean;
+  creatorId: string;
+  creatorName: string;
+  maxPlayers: number;
+  autoStartAt: number | null;
+  players: LobbyPlayer[];
+}
+
+export interface PublicRoomListing {
+  roomId: string;
+  roomCode: string;
+  creatorName: string;
+  playerCount: number;
+  maxPlayers: number;
+  autoStartAt: number | null;
+}
+
 export interface PublicGameState {
   id: string;
   roomId: string;
@@ -171,6 +247,7 @@ export interface PublicGameState {
   initialPlacementPlayerIds: string[];
   pendingCatPlacementPlayerIds: string[];
   pendingDrawNoticePlayerIds: string[];
+  pendingPrivateNoticePlayerIds: string[];
   waitingPlayerIds: string[];
   initialDrawChoicePlayerId: string | null;
   deckCount: number;
@@ -181,6 +258,8 @@ export interface PublicGameState {
   combat: PublicCombatState | null;
   pendingGlobalChoice: Pick<PendingGlobalChoice, "kind" | "actorId" | "playerIds" | "cursor"> | null;
   pendingDiscard: PendingDiscard | null;
+  announcement: GameAnnouncement | null;
+  lastCombatResult: CombatResult | null;
   winnerId: string | null;
   endedReason: GameState["endedReason"];
   log: GameLogEntry[];
@@ -194,8 +273,9 @@ export interface PublicCombatState {
   revealed: boolean;
   attackCardIds: string[];
   defenseCardId: string | null;
-  attackPower: number | null;
-  defensePower: number | null;
+  defenseSupportCardIds: string[];
+  attackDamage: number | null;
+  defenseDamage: number | null;
   redirectPlayerId: string | null;
   defenseExpiresAt: number | null;
 }
@@ -207,6 +287,7 @@ export interface PublicResponseWindow {
   pendingCardId: string;
   recipientIds: string[];
   cursor: number;
+  stackLength: number;
   expiresAt: number;
 }
 
@@ -220,7 +301,10 @@ export interface PrivateGameState {
   redirectAvailable: boolean;
   initialPlacementCats: CardInstance[];
   pendingCatPlacements: CardInstance[];
-  pendingDrawNotice: CardInstance[];
+  pendingDrawNotice: DrawNotice | null;
+  pendingPrivateNotice: PrivateGameNotice | null;
+  privateCombatCards: CardInstance[];
+  privateAttackDamage: number | null;
   peekedCards: CardInstance[];
 }
 
@@ -228,12 +312,13 @@ export type GameCommand =
   | { type: "choose-initial-cats"; placements: Array<{ catInstanceId: string; to: Zone }> }
   | { type: "choose-drawn-cats"; placements: Array<{ catInstanceId: string; to: Zone }> }
   | { type: "acknowledge-draw" }
+  | { type: "acknowledge-private-notice" }
   | { type: "choose-initial-draw"; useRaccoon: boolean }
   | { type: "skip-action-phase" }
   | { type: "activate-preaction"; ability: "curious" | "triplets" | "hyperactive" | "scratcher"; cards?: string[]; keepCardId?: string; movement?: MoveChoice }
   | { type: "play-card"; cardInstanceId: string; choices?: PendingEffect["choices"] }
   | { type: "declare-attack"; targetPlayerId: string; targetCardInstanceId: string; attackInstanceId: string; supportInstanceIds: string[] }
-  | { type: "choose-defense"; defenseInstanceId: string | null; supportInstanceIds: string[]; spyInstanceId?: string }
+  | { type: "choose-defense"; defenseInstanceId: string | null; supportInstanceIds: string[] }
   | { type: "redirect-attack"; cardInstanceId: string; targetPlayerId: string; targetCardInstanceId: string }
   | { type: "pass-redirect" }
   | { type: "reveal-attack"; method: "spy" | "nosy"; cardInstanceId?: string }

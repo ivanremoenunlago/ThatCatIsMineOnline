@@ -81,7 +81,11 @@ describe("card draws and discard reshuffles", () => {
     expect(next.actionsRemaining).toBe(0);
     expect(next.actionUsed).toBe(true);
 
-    const confirmed = applyGameCommand(next, player.id, { type: "acknowledge-draw" });
+    const firstConfirmed = applyGameCommand(next, player.id, { type: "acknowledge-draw" });
+    expect(firstConfirmed.phase).toBe("action");
+    expect(projectPrivateState(firstConfirmed, player.id).pendingDrawNotice?.card.instanceId).toBe("drawn-object-1");
+
+    const confirmed = applyGameCommand(firstConfirmed, player.id, { type: "acknowledge-draw" });
     expect(confirmed.phase).toBe("movement");
   });
 
@@ -115,6 +119,9 @@ describe("card draws and discard reshuffles", () => {
     state.currentPlayerIndex = 0;
     state.initialCatChoices = {};
     state.pendingCatPlacements = {};
+    state.pendingDrawNotices = {};
+    state.pendingPrivateNotices = {};
+    state.initialDrawChoicePlayerId = null;
     state.actionsRemaining = 1;
     state.actionUsed = false;
     player.hand = [{ instanceId: "scratcher-card", cardId: "structure-scratcher" }];

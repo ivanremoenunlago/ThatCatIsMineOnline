@@ -125,6 +125,77 @@ describe("game state projections", () => {
 
     defender.hand.push({ instanceId: "mouse-card", cardId: "object-mouse" });
     expect(projectPrivateState(state, defender.id).redirectAvailable).toBe(true);
+    other.sofa = [];
+    expect(projectPrivateState(state, defender.id).redirectAvailable).toBe(false);
+  });
+
+  it("allows Espía de Ventana to reveal the attack before the defender chooses", () => {
+    const state = createCombatFixture();
+    const attacker = state.players[0];
+    const defender = state.players[1];
+    const other = state.players[2];
+    if (!attacker || !defender || !other) throw new Error("The test game needs three players.");
+    defender.hand = [{ instanceId: "spy-card", cardId: "action-spy" }];
+    expect(projectPrivateState(state, attacker.id).privateCombatCards).toEqual([
+      { instanceId: "attack-card", cardId: "attack-hiss" },
+    ]);
+    expect(projectPrivateState(state, defender.id).privateCombatCards).toEqual([]);
+    expect(projectPublicState(state).combat?.attackCardIds).toEqual([]);
+    expect(projectPublicState(state).combat?.attackDamage).toBeNull();
+
+    const revealedWindow = applyGameCommand(state, defender.id, {
+      type: "reveal-attack",
+      method: "spy",
+      cardInstanceId: "spy-card",
+    });
+    expect(revealedWindow.phase).toBe("response");
+    expect(revealedWindow.combat?.revealed).toBe(false);
+    expect(projectPublicState(revealedWindow).responseWindow?.pendingCardId).toBe("action-spy");
+
+    const passedByOther = applyGameCommand(revealedWindow, other.id, { type: "pass-response" });
+    const spyResolved = applyGameCommand(passedByOther, attacker.id, { type: "pass-response" });
+    expect(spyResolved.phase).toBe("combat");
+    expect(spyResolved.combat?.revealed).toBe(true);
+    expect(projectPublicState(spyResolved).combat?.attackDamage).toBe(1);
+    expect(spyResolved.lastCombatResult).toBeNull();
+
+    const resolved = applyGameCommand(spyResolved, defender.id, {
+      type: "choose-defense",
+      defenseInstanceId: null,
+      supportInstanceIds: [],
+    });
+    expect(resolved.lastCombatResult).toMatchObject({
+      attackerId: attacker.id,
+      defenderId: defender.id,
+      attackCardId: "attack-hiss",
+      attackDamage: 1,
+      defenseCardId: null,
+      succeeded: true,
+    });
+    expect(projectPublicState(resolved).lastCombatResult?.targetCardId).toBe("cat-underfed");
+  });
+
+  it("rejects redirecting to the current target but allows redirecting to another own cat", () => {
+    const state = createCombatFixture();
+    const defender = state.players[1];
+    if (!defender) throw new Error("The test game needs a defender.");
+    defender.hand = [{ instanceId: "mouse-card", cardId: "object-mouse" }];
+    defender.salon = [{ instanceId: "own-cat", cardId: "cat-loner", ownerId: defender.id, zone: "salon" }];
+
+    expect(() => applyGameCommand(state, defender.id, {
+      type: "redirect-attack",
+      cardInstanceId: "mouse-card",
+      targetPlayerId: defender.id,
+      targetCardInstanceId: "target-cat",
+    })).toThrow("Elige otro objetivo distinto del que ya estaba siendo atacado.");
+
+    const redirected = applyGameCommand(state, defender.id, {
+      type: "redirect-attack",
+      cardInstanceId: "mouse-card",
+      targetPlayerId: defender.id,
+      targetCardInstanceId: "own-cat",
+    });
+    expect(redirected.responseWindow?.pending.card.cardId).toBe("object-mouse");
   });
 
   it("waits for the defender to accept an undefended attack and hides the redirect pass publicly", () => {
@@ -168,6 +239,11 @@ describe("game state projections", () => {
     actor.hand = [{ instanceId: "burglar-card", cardId: "action-cat-burglar" }];
     target.salon = [{ instanceId: "stolen-cat", cardId: "cat-loner", ownerId: target.id, zone: "salon" }];
     state.pendingDrawNotices = {};
+    state.pendingCatPlacements = {};
+    state.pendingPrivateNotices = {};
+    state.initialCatChoices = {};
+    state.initialDrawChoicePlayerId = null;
+    state.pendingChoices = {};
     state.phase = "action";
     state.currentPlayerIndex = 0;
     state.actionsRemaining = 1;
@@ -214,18 +290,24 @@ describe("game state projections", () => {
 
     expect(drawn.phase).toBe("action");
     expect(drawn.actionsRemaining).toBe(0);
-    expect(projectPrivateState(drawn, actor.id).pendingDrawNotice).toEqual([
-      { instanceId: "draw-two", cardId: "consumable-churu" },
-      { instanceId: "draw-one", cardId: "action-skip" },
-    ]);
-    expect(projectPrivateState(drawn, state.players[1]!.id).pendingDrawNotice).toEqual([]);
+    expect(projectPrivateState(drawn, actor.id).pendingDrawNotice).toEqual({
+      card: { instanceId: "draw-two", cardId: "consumable-churu" },
+      reason: "Lata de Atún: robo de 2 cartas",
+    });
+    expect(projectPrivateState(drawn, state.players[1]!.id).pendingDrawNotice).toBeNull();
     expect(projectPublicState(drawn).pendingDrawNoticePlayerIds).toEqual([actor.id]);
     expect(JSON.stringify(projectPublicState(drawn))).not.toContain("draw-one");
     expect(JSON.stringify(projectPublicState(drawn))).not.toContain("draw-two");
 
     const acknowledged = applyGameCommand(drawn, actor.id, { type: "acknowledge-draw" });
-    expect(acknowledged.phase).toBe("movement");
-    expect(acknowledged.pendingDrawNotices[actor.id]).toBeUndefined();
+    expect(projectPrivateState(acknowledged, actor.id).pendingDrawNotice).toEqual({
+      card: { instanceId: "draw-one", cardId: "action-skip" },
+      reason: "Lata de Atún: robo de 2 cartas",
+    });
+    expect(acknowledged.phase).toBe("action");
+    const allAcknowledged = applyGameCommand(acknowledged, actor.id, { type: "acknowledge-draw" });
+    expect(allAcknowledged.phase).toBe("movement");
+    expect(allAcknowledged.pendingDrawNotices[actor.id]).toBeUndefined();
   });
 
   it("combines a drawn-cat notice with its placement confirmation", () => {
@@ -251,7 +333,10 @@ describe("game state projections", () => {
       type: "play-card",
       cardInstanceId: "tuna-card",
     });
-    expect(projectPrivateState(drawn, actor.id).pendingDrawNotice).toHaveLength(2);
+    expect(projectPrivateState(drawn, actor.id).pendingDrawNotice).toEqual({
+      card: { instanceId: "draw-cat", cardId: "cat-underfed" },
+      reason: "Lata de Atún: robo de 2 cartas",
+    });
     expect(projectPrivateState(drawn, actor.id).pendingCatPlacements).toEqual([
       { instanceId: "draw-cat", cardId: "cat-underfed" },
     ]);
@@ -261,8 +346,14 @@ describe("game state projections", () => {
       placements: [{ catInstanceId: "draw-cat", to: "salon" }],
     });
     expect(placed.players[0]?.salon).toContainEqual(expect.objectContaining({ instanceId: "draw-cat" }));
-    expect(placed.pendingDrawNotices[actor.id]).toBeUndefined();
-    expect(placed.phase).toBe("movement");
+    expect(projectPrivateState(placed, actor.id).pendingDrawNotice).toEqual({
+      card: { instanceId: "draw-action", cardId: "action-skip" },
+      reason: "Lata de Atún: robo de 2 cartas",
+    });
+    expect(placed.phase).toBe("action");
+    const acknowledged = applyGameCommand(placed, actor.id, { type: "acknowledge-draw" });
+    expect(acknowledged.pendingDrawNotices[actor.id]).toBeUndefined();
+    expect(acknowledged.phase).toBe("movement");
   });
 
   it("only lets an attack winner choose the Sofa when it has capacity", () => {
@@ -374,6 +465,46 @@ describe("game state projections", () => {
     expect(resolved.log.at(-1)?.text).toBe(
       `${actor.name} juega Sobredosis de Catnip, pero ${canceler.name} la cancela con Flús-Flús de Agua.`,
     );
+  });
+
+  it("makes a Flús-Flús player choose the Victimista penalty discard", () => {
+    const state = createCombatFixture();
+    const [actor, canceler] = state.players;
+    if (!actor || !canceler) throw new Error("The test game needs two players.");
+    actor.sofa.push({ instanceId: "victim-cat", cardId: "cat-victim", ownerId: actor.id, zone: "sofa" });
+    canceler.hand = [{ instanceId: "extra-card", cardId: "object-mouse" }];
+    state.responseWindow = {
+      pending: {
+        id: "pending-catnip",
+        actorId: actor.id,
+        card: { instanceId: "catnip-card", cardId: "action-catnip" },
+        choices: {},
+      },
+      stack: [{
+        playerId: canceler.id,
+        card: { instanceId: "flush-card", cardId: "response-flush-1" },
+      }],
+      order: [actor.id],
+      cursor: 0,
+      expiresAt: Date.now() + 15_000,
+    };
+    state.phase = "response";
+
+    const cancelled = applyGameCommand(state, actor.id, { type: "pass-response" });
+    expect(cancelled.phase).toBe("discard");
+    expect(cancelled.pendingDiscard).toMatchObject({
+      playerIds: [canceler.id],
+      countByPlayer: { [canceler.id]: 1 },
+      reason: `Victimista de ${actor.name}`,
+    });
+    expect(cancelled.players[1]?.hand).toEqual([{ instanceId: "extra-card", cardId: "object-mouse" }]);
+
+    const discarded = applyGameCommand(cancelled, canceler.id, {
+      type: "discard-cards",
+      cardInstanceIds: ["extra-card"],
+    });
+    expect(discarded.players[1]?.hand).toHaveLength(0);
+    expect(discarded.phase).toBe("combat");
   });
 
   it("automatically accepts a defense that expires after 30 seconds", () => {
@@ -609,6 +740,8 @@ function createCombatFixture() {
     attackSupports: [],
     defense: null,
     defenseSupports: [],
+    attackDamage: null,
+    defenseDamage: null,
     defenseExpiresAt: Date.now() + 30_000,
     revealed: false,
     redirectedPlayers: [],

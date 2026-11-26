@@ -127,6 +127,13 @@ export function checkVictory(state: GameState, playerId: string): boolean {
   state.phase = "finished";
   state.responseWindow = null;
   state.combat = null;
+  state.pendingCatPlacements = {};
+  state.pendingDrawNotices = {};
+  state.pendingPrivateNotices = {};
+  state.pendingDiscard = null;
+  state.pendingGlobalChoice = null;
+  state.pendingSalvage = null;
+  state.pendingChoices = {};
   return true;
 }
 

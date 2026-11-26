@@ -4,10 +4,31 @@ import type {
   PublicGameState,
 } from "../../shared/game-types.js";
 import { SYNERGIES } from "../../shared/synergies.js";
-import { getPrestige, synergyIsActive, targetPrestige } from "./rules.js";
+import { findProtectedCat, getPrestige, synergyIsActive, targetPrestige } from "./rules.js";
+
+function hasLegalRedirectTarget(state: GameState, targetPlayerId: string): boolean {
+  const combat = state.combat;
+  if (!combat) return false;
+  return state.players.some((owner) => {
+    if (owner.id === combat.attackerId) return false;
+    const hasCatTarget =
+      owner.structure?.cardId !== "structure-box" &&
+      owner.structure?.cardId !== "structure-fortress" &&
+      [...owner.sofa, ...owner.salon].some((cat) =>
+        !findProtectedCat(owner, cat.instanceId) &&
+        !(owner.id === combat.targetPlayerId && cat.instanceId === combat.targetCardInstanceId),
+      );
+    const hasStructureTarget =
+      owner.structure !== null &&
+      owner.structure.cardId !== "structure-bed" &&
+      !(owner.id === combat.targetPlayerId && owner.structure.instanceId === combat.targetCardInstanceId);
+    return hasCatTarget || hasStructureTarget;
+  });
+}
 
 function waitingPlayerIds(state: GameState): string[] {
   if (state.phase === "initial_placement") return Object.keys(state.initialCatChoices);
+  if (Object.keys(state.pendingPrivateNotices).length > 0) return Object.keys(state.pendingPrivateNotices);
   if (Object.keys(state.pendingDrawNotices).length > 0) return Object.keys(state.pendingDrawNotices);
   if (Object.keys(state.pendingCatPlacements).length > 0) return Object.keys(state.pendingCatPlacements);
   if (state.responseWindow) {
@@ -72,6 +93,7 @@ export function projectPublicState(state: GameState): PublicGameState {
     initialPlacementPlayerIds: Object.keys(state.initialCatChoices),
     pendingCatPlacementPlayerIds: Object.keys(state.pendingCatPlacements),
     pendingDrawNoticePlayerIds: Object.keys(state.pendingDrawNotices),
+    pendingPrivateNoticePlayerIds: Object.keys(state.pendingPrivateNotices),
     waitingPlayerIds: waitingPlayerIds(state),
     initialDrawChoicePlayerId: state.initialDrawChoicePlayerId,
     deckCount: state.deck.length,
@@ -84,6 +106,7 @@ export function projectPublicState(state: GameState): PublicGameState {
           cardId: lastFlush?.card.cardId ?? responseWindow.pending.card.cardId,
           recipientIds: [...responseWindow.order],
           cursor: responseWindow.cursor,
+          stackLength: responseWindow.stack.length,
           expiresAt: responseWindow.expiresAt,
           pendingActorId: responseWindow.pending.actorId,
           pendingCardId: responseWindow.pending.card.cardId,
@@ -100,8 +123,9 @@ export function projectPublicState(state: GameState): PublicGameState {
             ? [combat.attack.cardId, ...combat.attackSupports.map((card) => card.cardId)]
             : [],
           defenseCardId: revealed ? combat.defense?.cardId ?? null : null,
-          attackPower: null,
-          defensePower: null,
+          defenseSupportCardIds: revealed ? combat.defenseSupports.map((card) => card.cardId) : [],
+          attackDamage: revealed ? combat.attackDamage : null,
+          defenseDamage: revealed ? combat.defenseDamage : null,
           redirectPlayerId: combat.redirectPlayerId,
           defenseExpiresAt: combat.defenseExpiresAt,
         }
@@ -115,6 +139,8 @@ export function projectPublicState(state: GameState): PublicGameState {
         }
       : null,
     pendingDiscard: state.pendingDiscard ? structuredClone(state.pendingDiscard) : null,
+    announcement: state.announcement ? structuredClone(state.announcement) : null,
+    lastCombatResult: state.lastCombatResult ? structuredClone(state.lastCombatResult) : null,
     winnerId: state.winnerId,
     endedReason: state.endedReason,
     log: structuredClone(state.log),
@@ -131,11 +157,20 @@ export function projectPrivateState(state: GameState, playerId: string): Private
     litter: structuredClone(player.litter),
     initialPlacementCats: structuredClone(state.initialCatChoices[playerId] ?? []),
     pendingCatPlacements: structuredClone(state.pendingCatPlacements[playerId] ?? []),
-    pendingDrawNotice: structuredClone(state.pendingDrawNotices[playerId] ?? []),
+    pendingDrawNotice: structuredClone(state.pendingDrawNotices[playerId]?.[0] ?? null),
+    pendingPrivateNotice: structuredClone(state.pendingPrivateNotices[playerId]?.[0] ?? null),
+    privateCombatCards: state.combat?.attackerId === playerId
+      ? structuredClone([state.combat.attack, ...state.combat.attackSupports])
+      : [],
+    privateAttackDamage: state.combat?.attackerId === playerId
+      ? state.combat.attackDamage
+      : null,
     yourTurn:
       state.players[state.currentPlayerIndex]?.id === playerId ||
       Boolean(state.initialCatChoices[playerId]) ||
       Boolean(state.pendingCatPlacements[playerId]) ||
+      Boolean(state.pendingDrawNotices[playerId]?.length) ||
+      Boolean(state.pendingPrivateNotices[playerId]?.length) ||
       state.pendingDiscard?.playerIds[state.pendingDiscard.cursor] === playerId ||
       state.pendingGlobalChoice?.playerIds[state.pendingGlobalChoice.cursor] === playerId ||
       state.responseWindow?.order[state.responseWindow.cursor] === playerId ||
@@ -148,7 +183,8 @@ export function projectPrivateState(state: GameState, playerId: string): Private
         state.combat?.redirectPlayerId === playerId &&
         state.combat.targetPlayerId === playerId &&
         !state.combat.redirectedPlayers.includes(playerId) &&
-        player.hand.some((card) => card.cardId === "object-mouse"),
+        player.hand.some((card) => card.cardId === "object-mouse") &&
+        hasLegalRedirectTarget(state, playerId),
     ),
     peekedCards: structuredClone(state.privatePeeks[playerId] ?? []),
   };

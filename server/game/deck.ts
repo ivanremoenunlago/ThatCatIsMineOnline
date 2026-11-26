@@ -46,13 +46,23 @@ export function queueCatPlacement(state: GameState, player: PlayerState, card: C
   state.pendingCatPlacements[player.id] = pending;
 }
 
-export function queueDrawNotice(state: GameState, player: PlayerState, card: CardInstance): void {
+export function queueDrawNotice(
+  state: GameState,
+  player: PlayerState,
+  card: CardInstance,
+  reason: string,
+): void {
   const pending = state.pendingDrawNotices[player.id] ?? [];
-  pending.push(card);
+  pending.push({ card, reason });
   state.pendingDrawNotices[player.id] = pending;
 }
 
-export function drawCards(state: GameState, player: PlayerState, amount: number): number {
+export function drawCards(
+  state: GameState,
+  player: PlayerState,
+  amount: number,
+  reason = "robo del mazo",
+): number {
   let drawn = 0;
   for (let index = 0; index < amount; index += 1) {
     const instance = takeTopCard(state);
@@ -60,7 +70,7 @@ export function drawCards(state: GameState, player: PlayerState, amount: number)
     drawn += 1;
     const definition = CARD_BY_ID.get(instance.cardId);
     if (!definition) throw new Error(`Card definition missing for ${instance.cardId}`);
-    queueDrawNotice(state, player, instance);
+    queueDrawNotice(state, player, instance, reason);
     if (definition.kind === "cat") {
       queueCatPlacement(state, player, instance);
     } else {
