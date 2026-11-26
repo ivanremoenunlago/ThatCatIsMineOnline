@@ -941,6 +941,9 @@ function swapCats(
 }
 
 function removeCat(owner: PlayerState, cat: PlayerState["sofa"][number]): void {
+  if (findProtectedCat(owner, cat.instanceId)) {
+    throw new RuleError("La Cama de Peluche protege a ese gato y evita que se retire.");
+  }
   const collection = cat.zone === "sofa" ? owner.sofa : owner.salon;
   const index = collection.findIndex((candidate) => candidate.instanceId === cat.instanceId);
   if (index < 0) throw new RuleError("No se pudo retirar el gato de su zona.");

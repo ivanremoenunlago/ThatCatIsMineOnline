@@ -52,6 +52,9 @@ export function projectPublicState(state: GameState): PublicGameState {
       sofa: structuredClone(player.sofa),
       salon: structuredClone(player.salon),
       structure: player.structure ? structuredClone(player.structure) : null,
+      structureProtectedCatId: player.structure?.cardId === "structure-bed"
+        ? player.structureProtectedCatId
+        : null,
       litterCount: player.litter.length,
       prestige: getPrestige(player, state),
       targetPrestige: targetPrestige(state.players.length),

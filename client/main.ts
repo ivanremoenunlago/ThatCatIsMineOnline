@@ -68,6 +68,15 @@ function cardImage(cardId: string): string {
   return CARD_BY_ID.get(cardId)?.image ?? "";
 }
 
+function isProtectedCat(player: PublicPlayerState, cat: PublicPlayerState["sofa"][number]): boolean {
+  return player.structure?.cardId === "structure-bed" &&
+    player.structureProtectedCatId === cat.instanceId;
+}
+
+function movableCats(player: PublicPlayerState): PublicPlayerState["sofa"] {
+  return [...player.sofa, ...player.salon].filter((cat) => !isProtectedCat(player, cat));
+}
+
 function cardPreviewTrigger(cardId: string, name: string, className = ""): string {
   return `<img class="card-preview-trigger ${className}" data-card-preview="${escapeHtml(cardId)}"
     src="${escapeHtml(cardImage(cardId))}" alt="" role="button" tabindex="0"
@@ -238,10 +247,11 @@ function renderLobby(): void {
     </main>`;
 }
 
-function cardTile(cardId: string, name: string): string {
+function cardTile(cardId: string, name: string, status = ""): string {
   return `<div class="card-tile">
     ${cardPreviewTrigger(cardId, name)}
     <div><b>${escapeHtml(name)}</b><small>${escapeHtml(CARD_BY_ID.get(cardId)?.description ?? "")}</small></div>
+    ${status ? `<span class="card-status">${escapeHtml(status)}</span>` : ""}
   </div>`;
 }
 
@@ -319,8 +329,13 @@ function renderCatPlacementPanel(
 function renderBoardPlayer(player: PublicPlayerState): string {
   const zone = (title: string, className: string, cats: PublicPlayerState["sofa"]) =>
     `<div class="zone ${className}"><h4>${title}</h4>${cats.length
-      ? cats.map((cat) => cardTile(cat.cardId, cardName(cat.cardId))).join("")
+      ? cats.map((cat) => cardTile(
+        cat.cardId,
+        cardName(cat.cardId),
+        isProtectedCat(player, cat) ? "Protegido por Cama de Peluche" : "",
+      )).join("")
       : `<p class="empty">Vacío</p>`}</div>`;
+  const protectedCat = [...player.sofa, ...player.salon].find((cat) => isProtectedCat(player, cat));
   return `<article class="board-player ${player.isCurrentPlayer ? "active" : ""}">
     <header><div><h3>${escapeHtml(player.name)}${player.isCurrentPlayer ? " · turno" : ""}</h3>
       <span>${player.prestige}/${player.targetPrestige} prestigio · ${player.handCount} cartas</span></div>
@@ -333,7 +348,13 @@ function renderBoardPlayer(player: PublicPlayerState): string {
     <div class="board-zones">
       ${zone("Sofá", "sofa-zone", player.sofa)}
       <div class="zone structure-zone"><h4>Estructura</h4>${player.structure
-        ? cardTile(player.structure.cardId, cardName(player.structure.cardId))
+        ? cardTile(
+          player.structure.cardId,
+          cardName(player.structure.cardId),
+          player.structure.cardId === "structure-bed" && protectedCat
+            ? `Protegiendo a ${cardName(protectedCat.cardId)}`
+            : "",
+        )
         : `<p class="empty">Vacía</p>`}</div>
       ${zone("Salón", "salon-zone", player.salon)}
     </div>
@@ -352,7 +373,7 @@ function renderActionPanel(): string {
   const me = state.players.find((player) => player.id === account!.id);
   if (!me) return "";
   const opponents = state.players.filter((player) => player.id !== account!.id);
-  const myCats = [...me.sofa, ...me.salon];
+  const myMovableCats = movableCats(me);
   const selectedCard = privateState.hand.find((card) => card.instanceId === selectedCardId);
   const selectedDefinition = selectedCard ? CARD_BY_ID.get(selectedCard.cardId) : undefined;
   const selectedOpponentId = opponents[0]?.id ?? "";
@@ -360,10 +381,17 @@ function renderActionPanel(): string {
   const targetCats = (playerId: string) => {
     const target = state.players.find((player) => player.id === playerId);
     if (!target) return [];
-    return [...target.sofa, ...target.salon].map((cat) => ({ id: cat.instanceId, label: `${cardName(cat.cardId)} · ${cat.zone === "sofa" ? "Sofá" : "Salón"}` }));
+    return [
+      ...target.sofa.filter((cat) => !isProtectedCat(target, cat)),
+      ...target.salon.filter((cat) => !isProtectedCat(target, cat)),
+    ].map((cat) => ({ id: cat.instanceId, label: `${cardName(cat.cardId)} · ${cat.zone === "sofa" ? "Sofá" : "Salón"}` }));
   };
   const laserOwners = laserEligibleOwners(state);
   const sofaOptions = selectOptions(me.sofa.map((cat) => ({ id: cat.instanceId, label: cardName(cat.cardId) })), "Gato del Sofá");
+  const movableSofaOptions = selectOptions(
+    me.sofa.filter((cat) => !isProtectedCat(me, cat)).map((cat) => ({ id: cat.instanceId, label: cardName(cat.cardId) })),
+    "Gato del Sofá",
+  );
   const handControls = `<div class="hand">${privateState.hand.map((card) => {
     const definition = CARD_BY_ID.get(card.cardId);
     const canSelect =
@@ -475,7 +503,7 @@ function renderActionPanel(): string {
     }
     if (pending.kind === "neighbor-dog") {
       return interactionPopup(`<section class="panel"><h3>El perro del vecino</h3><label>Gato que baja al Salón
-        <select name="choice-cat">${sofaOptions}</select></label>
+        <select name="choice-cat">${movableSofaOptions}</select></label>
         <button class="primary" data-action="global-choice" data-choice-kind="dog">Confirmar</button>
         <button class="quiet" data-action="global-choice" data-choice-kind="dog-pass">No puedo mover</button></section>`,
       "choice-popup");
@@ -600,7 +628,7 @@ function renderActionPanel(): string {
     const canCurious = canPrepare && me.sofa.some((cat) => cat.cardId === "cat-curious") && privateState.hand.length > 0;
     const tripletCount = me.sofa.filter((cat) => cat.cardId.startsWith("cat-triplet-")).length;
     const canTriplets = canPrepare && tripletCount > 0;
-    const canHyperactive = canPrepare && me.sofa.some((cat) => cat.cardId === "cat-hyperactive");
+    const canHyperactive = canPrepare && me.sofa.some((cat) => cat.cardId === "cat-hyperactive") && myMovableCats.length > 0;
     const canScratcher = canPrepare && me.structure?.cardId === "structure-scratcher" && privateState.hand.length > 0;
     phaseControls = `<div class="controls">
       ${canCurious ? `<button class="quiet" data-action="preaction" data-ability="curious">Activar Curioso (descarta seleccionada)</button>` : ""}
@@ -609,7 +637,7 @@ function renderActionPanel(): string {
       ${canTriplets ? `<fieldset><legend>Cartas para Trillizos (${tripletCount})</legend>${privateState.hand.map((card) =>
         `<label class="inline"><input type="checkbox" name="triplet-card" value="${escapeHtml(card.instanceId)}" />${escapeHtml(cardName(card.cardId))}</label>`,
       ).join("")}</fieldset>` : ""}
-      ${canHyperactive ? `<label>Gato para Hiperactivo<select name="hyper-cat">${selectOptions(myCats.map((cat) => ({ id: cat.instanceId, label: cardName(cat.cardId) })), "Elige un gato")}</select></label>
+      ${canHyperactive ? `<label>Gato para Hiperactivo<select name="hyper-cat">${selectOptions(myMovableCats.map((cat) => ({ id: cat.instanceId, label: cardName(cat.cardId) })), "Elige un gato")}</select></label>
         <label>Destino<select name="hyper-to"><option value="salon">Salón</option><option value="sofa">Sofá</option></select></label>
         <button class="quiet" data-action="preaction" data-ability="hyperactive">Activar Hiperactivo</button>` : ""}
       ${canScratcher ? `<button class="quiet" data-action="preaction" data-ability="scratcher">Activar Rascador (descarta seleccionada)</button>` : ""}
@@ -618,9 +646,11 @@ function renderActionPanel(): string {
     </div>`;
   } else if (state.phase === "movement") {
     phaseControls = `<div class="controls">
-      <label>Gato<select name="move-cat">${selectOptions(myCats.map((cat) => ({ id: cat.instanceId, label: cardName(cat.cardId) })), "Elige un gato")}</select></label>
-      <label>Destino<select name="move-to"><option value="salon">Salón</option><option value="sofa">Sofá</option></select></label>
-      <button class="quiet" data-action="move">Mover gato</button>
+      ${myMovableCats.length
+        ? `<label>Gato<select name="move-cat">${selectOptions(myMovableCats.map((cat) => ({ id: cat.instanceId, label: cardName(cat.cardId) })), "Elige un gato")}</select></label>
+          <label>Destino<select name="move-to"><option value="salon">Salón</option><option value="sofa">Sofá</option></select></label>
+          <button class="quiet" data-action="move">Mover gato</button>`
+        : `<p class="hint">No tienes gatos que puedas mover. La Cama de Peluche protege a los gatos que ha elegido.</p>`}
       <button class="primary" data-action="finish-movement">Terminar movimiento</button>
     </div>`;
   }
@@ -658,21 +688,29 @@ function renderMultiHandControls(hand: PrivateGameState["hand"]): string {
     <b>${escapeHtml(cardName(card.cardId))}</b></label>`).join("")}</div>`;
 }
 
-function targetCats(state: PublicGameState, playerId: string): Array<{ id: string; label: string }> {
+function targetCats(
+  state: PublicGameState,
+  playerId: string,
+  includeStructure = true,
+): Array<{ id: string; label: string }> {
   const target = state.players.find((player) => player.id === playerId);
   if (!target) return [];
-  const cats = [...target.sofa, ...target.salon].map((cat) => ({
+  const cats = [...target.sofa, ...target.salon]
+    .filter((cat) => !isProtectedCat(target, cat))
+    .map((cat) => ({
     id: cat.instanceId,
     label: `${cardName(cat.cardId)} · ${cat.zone === "sofa" ? "Sofá" : "Salón"}`,
   }));
-  if (target.structure) cats.push({ id: target.structure.instanceId, label: cardName(target.structure.cardId) });
+  if (includeStructure && target.structure && target.structure.cardId !== "structure-bed") {
+    cats.push({ id: target.structure.instanceId, label: cardName(target.structure.cardId) });
+  }
   return cats;
 }
 
 function catOptionsForPlayer(state: PublicGameState, playerId: string): Array<{ id: string; label: string }> {
   const player = state.players.find((candidate) => candidate.id === playerId);
   if (!player) return [];
-  return [...player.sofa, ...player.salon].map((cat) => ({
+  return [...player.sofa, ...player.salon].filter((cat) => !isProtectedCat(player, cat)).map((cat) => ({
     id: cat.instanceId,
     label: `${cardName(cat.cardId)} · ${cat.zone === "sofa" ? "Sofá" : "Salón"}`,
   }));
@@ -680,20 +718,25 @@ function catOptionsForPlayer(state: PublicGameState, playerId: string): Array<{ 
 
 function laserEligibleOwners(state: PublicGameState): PublicPlayerState[] {
   if (state.activeEffects.some((effect) => effect.kind === "strike")) return [];
-  return state.players.filter((player) => player.sofa.length + player.salon.length > 0);
+  return state.players.filter((player) => movableCats(player).length > 0);
 }
 
 function laserDestinationOptions(state: PublicGameState, ownerId: string, catId: string): string {
   const owner = state.players.find((player) => player.id === ownerId);
   const cat = owner ? [...owner.sofa, ...owner.salon].find((candidate) => candidate.instanceId === catId) : undefined;
-  if (!cat) return `<option value="" selected disabled>Elige primero un gato</option>`;
+  if (!owner || !cat) return `<option value="" selected disabled>Elige primero un gato</option>`;
+  if (isProtectedCat(owner, cat)) {
+    return `<option value="" selected disabled>Protegido por Cama de Peluche</option>`;
+  }
   const destination = cat.zone === "sofa" ? "salon" : "sofa";
   return `<option value="${destination}" selected>${destination === "sofa" ? "Sofá" : "Salón"}</option>`;
 }
 
 function salonCatOptions(state: PublicGameState, playerId: string): Array<{ id: string; label: string }> {
   const player = state.players.find((candidate) => candidate.id === playerId);
-  return player?.salon.map((cat) => ({ id: cat.instanceId, label: cardName(cat.cardId) })) ?? [];
+  return player?.salon
+    .filter((cat) => !isProtectedCat(player, cat))
+    .map((cat) => ({ id: cat.instanceId, label: cardName(cat.cardId) })) ?? [];
 }
 
 function renderSelectedCardForm(
@@ -705,7 +748,7 @@ function renderSelectedCardForm(
   sofaOptions: string,
 ): string {
   const targetPlayer = opponents[0]?.id ?? "";
-  const allCats = [...me.sofa, ...me.salon].map((cat) => ({ id: cat.instanceId, label: cardName(cat.cardId) }));
+  const allCats = movableCats(me).map((cat) => ({ id: cat.instanceId, label: cardName(cat.cardId) }));
   const otherCards = privateState!.hand.filter((card) => card.instanceId !== selectedCardId);
   const targetEffects = ["skip_turn", "random_discard", "steal_random", "swap_cats", "steal_living_room_cat", "sabotage"];
   let fields = "";
@@ -722,7 +765,7 @@ function renderSelectedCardForm(
     fields += `<label>Gato del Salón rival<select name="targetCatInstanceId">${selectOptions(salonCatOptions(state, targetPlayer), "Elige el gato")}</select></label>`;
   }
   if (effect === "swap_cats") {
-    fields += `<label>Gato rival<select name="targetCatInstanceId">${selectOptions(targetCats(state, targetPlayer), "Elige el gato")}</select></label>`;
+    fields += `<label>Gato rival<select name="targetCatInstanceId">${selectOptions(targetCats(state, targetPlayer, false), "Elige el gato")}</select></label>`;
   }
   if (effect === "swap_cats") {
     fields += `<label>Tu gato<select name="ownCatInstanceId">${selectOptions(allCats, "Elige tu gato")}</select></label>`;
@@ -732,7 +775,9 @@ function renderSelectedCardForm(
     if (laserOwners.length === 0) {
       const message = state.activeEffects.some((activeEffect) => activeEffect.kind === "strike")
         ? "La Huelga bloquea los movimientos entre el Sofá y el Salón."
-        : "No hay gatos en ninguna casa para mover con el Láser.";
+        : state.players.some((player) => player.sofa.length + player.salon.length > 0)
+          ? "Todos los gatos disponibles están protegidos por una Cama de Peluche."
+          : "No hay gatos en ninguna casa para mover con el Láser.";
       fields += `<p class="hint">${message}</p>`;
     } else {
       const owner = laserOwners.find((player) => player.id === me.id) ?? laserOwners[0]!;

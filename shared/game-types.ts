@@ -149,6 +149,7 @@ export interface PublicPlayerState {
   sofa: BoardCat[];
   salon: BoardCat[];
   structure: CardInstance | null;
+  structureProtectedCatId: string | null;
   litterCount: number;
   prestige: number;
   targetPrestige: number;

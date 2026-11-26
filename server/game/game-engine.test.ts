@@ -423,7 +423,166 @@ describe("game state projections", () => {
     })).toThrow("Un efecto activo impide mover ese gato entre zonas.");
     expect(actor.hand).toContainEqual({ instanceId: "laser-card", cardId: "action-laser" });
   });
+
+  it("publishes which cat the Bed protects and blocks every movement route", () => {
+    const { state, owner } = createBedFixture();
+    expect(projectPublicState(state).players[0]?.structureProtectedCatId).toBe("protected-cat");
+
+    expect(() => applyGameCommand(state, owner.id, {
+      type: "move",
+      movement: { playerId: owner.id, catInstanceId: "protected-cat", to: "salon" },
+    })).toThrow("Un efecto activo impide mover ese gato entre zonas.");
+
+    state.phase = "action";
+    expect(() => applyGameCommand(state, owner.id, {
+      type: "activate-preaction",
+      ability: "hyperactive",
+      movement: { playerId: owner.id, catInstanceId: "protected-cat", to: "salon" },
+    })).toThrow("Un efecto activo impide mover ese gato entre zonas.");
+
+    owner.hand = [{ instanceId: "laser-card", cardId: "action-laser" }];
+    expect(() => applyGameCommand(state, owner.id, {
+      type: "play-card",
+      cardInstanceId: "laser-card",
+      choices: { ownerId: owner.id, catInstanceId: "protected-cat", to: "salon" },
+    })).toThrow("Un efecto activo impide mover ese gato entre zonas.");
+
+    state.phase = "choice";
+    state.pendingGlobalChoice = {
+      kind: "neighbor-dog",
+      actorId: owner.id,
+      card: { instanceId: "dog-card", cardId: "event-dog" },
+      playerIds: [owner.id],
+      cursor: 0,
+      choices: {},
+    };
+    expect(() => applyGameCommand(state, owner.id, {
+      type: "resolve-choice",
+      choice: "protected-cat",
+    })).toThrow("No puedes mover ese gato ahora.");
+  });
+
+  it("rejects Puerta Gatera and Robo Felino when either would remove a protected cat", () => {
+    const { state, owner, opponent } = createBedFixture();
+    const otherCat = {
+      instanceId: "other-cat",
+      cardId: "cat-underfed",
+      ownerId: opponent.id,
+      zone: "sofa" as const,
+    };
+    opponent.sofa = [otherCat];
+    owner.hand = [{ instanceId: "door-card", cardId: "action-cat-door" }];
+    state.phase = "action";
+    state.actionsRemaining = 1;
+
+    expect(() => passResponseWindow(applyGameCommand(state, owner.id, {
+      type: "play-card",
+      cardInstanceId: "door-card",
+      choices: {
+        targetPlayerId: opponent.id,
+        ownCatInstanceId: "protected-cat",
+        targetCatInstanceId: "other-cat",
+      },
+    }))).toThrow("La Cama de Peluche impide intercambiar al gato protegido.");
+
+    owner.structure = null;
+    owner.structureProtectedCatId = null;
+    opponent.structure = { instanceId: "opponent-bed", cardId: "structure-bed" };
+    opponent.structureProtectedCatId = "other-cat";
+    owner.sofa = [{
+      instanceId: "owner-cat",
+      cardId: "cat-underfed",
+      ownerId: owner.id,
+      zone: "sofa",
+    }];
+    opponent.sofa = [otherCat];
+    expect(() => passResponseWindow(applyGameCommand(state, owner.id, {
+      type: "play-card",
+      cardInstanceId: "door-card",
+      choices: {
+        targetPlayerId: opponent.id,
+        ownCatInstanceId: "owner-cat",
+        targetCatInstanceId: "other-cat",
+      },
+    }))).toThrow("La Cama de Peluche impide intercambiar al gato protegido.");
+
+    opponent.structureProtectedCatId = "opponent-cat";
+    opponent.salon = [{
+      instanceId: "opponent-cat",
+      cardId: "cat-loner",
+      ownerId: opponent.id,
+      zone: "salon",
+    }];
+    owner.hand = [{ instanceId: "burglar-card", cardId: "action-cat-burglar" }];
+    state.currentPlayerIndex = 0;
+    state.phase = "action";
+    state.actionsRemaining = 1;
+
+    expect(() => passResponseWindow(applyGameCommand(state, owner.id, {
+      type: "play-card",
+      cardInstanceId: "burglar-card",
+      choices: { targetPlayerId: opponent.id, targetCatInstanceId: "opponent-cat" },
+    }))).toThrow("La Cama de Peluche protege a ese gato y evita que se retire.");
+  });
+
+  it("does not allow attacks against a protected cat or the Bed itself", () => {
+    const { state, owner, opponent } = createBedFixture();
+    opponent.hand = [{ instanceId: "attack-card", cardId: "attack-hiss" }];
+    state.currentPlayerIndex = 1;
+    state.phase = "action";
+    state.actionsRemaining = 1;
+
+    expect(() => applyGameCommand(state, opponent.id, {
+      type: "declare-attack",
+      targetPlayerId: owner.id,
+      targetCardInstanceId: "protected-cat",
+      attackInstanceId: "attack-card",
+      supportInstanceIds: [],
+    })).toThrow("La Cama de Peluche protege a ese gato.");
+
+    expect(() => applyGameCommand(state, opponent.id, {
+      type: "declare-attack",
+      targetPlayerId: owner.id,
+      targetCardInstanceId: "bed-card",
+      attackInstanceId: "attack-card",
+      supportInstanceIds: [],
+    })).toThrow("La Cama no puede ser objetivo de un ataque.");
+  });
 });
+
+function createBedFixture() {
+  const state = createGame("test-room", [
+    { id: "player-1", name: "gato1" },
+    { id: "player-2", name: "gato2" },
+  ]);
+  const owner = state.players[0];
+  const opponent = state.players[1];
+  if (!owner || !opponent) throw new Error("The test game needs two players.");
+  owner.structure = { instanceId: "bed-card", cardId: "structure-bed" };
+  owner.structureProtectedCatId = "protected-cat";
+  owner.sofa = [{
+    instanceId: "protected-cat",
+    cardId: "cat-hyperactive",
+    ownerId: owner.id,
+    zone: "sofa",
+  }];
+  state.pendingDrawNotices = {};
+  state.pendingCatPlacements = {};
+  state.currentPlayerIndex = 0;
+  state.phase = "movement";
+  state.actionsRemaining = 1;
+  return { state, owner, opponent };
+}
+
+function passResponseWindow(state: ReturnType<typeof createGame>): ReturnType<typeof createGame> {
+  let next = state;
+  while (next.responseWindow) {
+    const responderId = next.responseWindow.order[next.responseWindow.cursor];
+    if (!responderId) throw new Error("The response window has no current responder.");
+    next = applyGameCommand(next, responderId, { type: "pass-response" });
+  }
+  return next;
+}
 
 function createCombatFixture() {
   const state = createGame("test-room", [

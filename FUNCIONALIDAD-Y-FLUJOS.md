@@ -100,7 +100,7 @@ Este documento describe el comportamiento actual del juego web, las decisiones d
 La aplicación tiene pruebas para las reglas implementadas, pero las siguientes interpretaciones siguen siendo provisionales y deben contrastarse con el reglamento definitivo antes de publicar:
 
 - Huelga bloquea los movimientos voluntarios entre Sofá y Salón, pero no la colocación de gatos recién recibidos.
-- Cama protege al gato elegido de ataques y movimientos mientras la estructura siga en juego.
+- Cama muestra en el tablero qué gato protege y bloquea seleccionarlo para movimientos normales, Hiperactivo, Láser, Perro del Vecino o intercambios; tampoco permite atacarlo ni retirarlo con efectos. Los selectores omiten esos gatos y la protección termina al salir la Cama de juego.
 - Veteranos del barrio añade prestigio y anula bonificaciones de daño de la pareja.
 - Curioso devuelve las cartas no elegidas a la parte superior del mazo, conservando el orden.
 - Los gatos capturados por ataque o Robo Felino permiten elegir destino, salvo los intercambios de Puerta Gatera.
