@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#292435" />
+    <title>¡Ese gato es mío!</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <dialog id="card-preview" aria-labelledby="card-preview-title">
+      <header class="card-preview-header">
+        <h2 id="card-preview-title"></h2>
+        <form method="dialog"><button class="quiet" aria-label="Cerrar carta ampliada">Cerrar</button></form>
+      </header>
+      <img id="card-preview-image" alt="" />
+      <p id="card-preview-description"></p>
+    </dialog>
+    <dialog id="discard-dialog" aria-labelledby="discard-title">
+      <header class="card-preview-header">
+        <h2 id="discard-title">Pila de descartes</h2>
+        <form method="dialog"><button class="quiet" aria-label="Cerrar pila de descartes">Cerrar</button></form>
+      </header>
+      <div id="discard-list" class="discard-list"></div>
+    </dialog>
+    <dialog id="synergy-dialog" aria-labelledby="synergy-title">
+      <header class="card-preview-header">
+        <h2 id="synergy-title">Sinergias activas</h2>
+        <form method="dialog"><button class="quiet" aria-label="Cerrar sinergias">Cerrar</button></form>
+      </header>
+      <div id="synergy-list" class="synergy-list"></div>
+    </dialog>
+    <script type="module" src="/client/main.ts"></script>
+  </body>
+</html>

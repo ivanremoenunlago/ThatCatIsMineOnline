@@ -1,0 +1,11 @@
+node_modules/
+dist/
+build/
+coverage/
+.env
+data/*.sqlite
+data/*.sqlite-shm
+data/*.sqlite-wal
+server/data/*.sqlite
+server/data/*.sqlite-shm
+server/data/*.sqlite-wal
